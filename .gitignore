@@ -1,0 +1,52 @@
+####################################
+# Python
+####################################
+backend/venv/
+backend/__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+
+####################################
+# Backend data & databases
+####################################
+backend/data/chroma_db/
+backend/data/chat_history.db
+backend/data/documents/
+backend/data/extracted_images/
+
+####################################
+# Vector stores / embeddings
+####################################
+**/vectorstore/
+**/embeddings/
+*.bin
+*.onnx
+
+####################################
+# Environment variables
+####################################
+.env
+backend/.env
+frontend/.env
+
+####################################
+# Frontend (Node / React)
+####################################
+frontend/node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+####################################
+# Claude / AI tools
+####################################
+.claude/
+
+####################################
+# OS / Editor
+####################################
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
