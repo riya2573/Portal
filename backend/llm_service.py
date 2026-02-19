@@ -1,7 +1,7 @@
 import requests
 import json
 from typing import List
-from config import OLLAMA_API_URL, OLLAMA_MODEL, SYSTEM_PROMPT, IMAGE_SEARCH_PROMPT
+from config import OLLAMA_API_URL, OLLAMA_MODEL, SYSTEM_PROMPT, IMAGE_SEARCH_PROMPT, OLLAMA_TIMEOUT
 
 
 class LLMService:
@@ -76,7 +76,7 @@ class LLMService:
                 "temperature": 0.7,
             }
 
-            response = requests.post(url, json=payload, timeout=120)
+            response = requests.post(url, json=payload, timeout=OLLAMA_TIMEOUT)
             response.raise_for_status()
 
             result = response.json()
@@ -112,7 +112,7 @@ class LLMService:
                 "temperature": 0.7,
             }
 
-            with requests.post(url, json=payload, stream=True, timeout=120) as response:
+            with requests.post(url, json=payload, stream=True, timeout=OLLAMA_TIMEOUT) as response:
                 response.raise_for_status()
                 for line in response.iter_lines():
                     if line:

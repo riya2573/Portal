@@ -1,101 +1,137 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react';
-import './styles/App.css';
-import ChatWindow from './components/ChatWindow';
-import SettingsModal from './components/SettingsModal';
-import { chatAPI, sessionAPI } from './services/api';
+import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
+import Sidebar from './components/Sidebar';
+import ChatArea from './components/ChatArea';
+import { chatAPI, sessionAPI, topicAPI } from './services/api';
+
+// Memoized Sidebar wrapper
+const MemoizedSidebar = React.memo(Sidebar);
+const MemoizedChatArea = React.memo(ChatArea);
 
 function App() {
+  // Theme state
+  const [darkMode, setDarkMode] = useState(() => {
+    const saved = localStorage.getItem('darkMode');
+    if (saved !== null) return JSON.parse(saved);
+    return window.matchMedia('(prefers-color-scheme: dark)').matches;
+  });
+
+  // Sidebar state
+  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+
+  // Chat state
   const [messages, setMessages] = useState([]);
   const [loading, setLoading] = useState(false);
   const [sessions, setSessions] = useState([]);
   const [currentSessionId, setCurrentSessionId] = useState(null);
   const [apiConnected, setApiConnected] = useState(false);
-  const [sidebarOpen, setSidebarOpen] = useState(true);
-  const [settingsOpen, setSettingsOpen] = useState(false);
-  const [theme, setTheme] = useState(() => {
-    // Initialize theme from localStorage or system preference
-    const savedTheme = localStorage.getItem('theme');
-    if (savedTheme) return savedTheme;
-    return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
-  });
+
+  // Topic filter state (dynamic from backend)
+  const [availableTopics, setAvailableTopics] = useState([]);
+  const [selectedTopics, setSelectedTopics] = useState([]);
+
+  // Stats
   const [stats, setStats] = useState({
     indexed_documents: 0,
     indexed_images: 0,
     chat_messages: 0,
     sessions: 0,
   });
+
+  // Refs for streaming
   const streamingMessageRef = useRef(null);
   const pendingImagesRef = useRef([]);
   const pendingSourcesRef = useRef([]);
 
-  // Apply theme to document
+  // Apply dark mode
   useEffect(() => {
-    document.documentElement.setAttribute('data-theme', theme);
-    localStorage.setItem('theme', theme);
-  }, [theme]);
+    if (darkMode) {
+      document.documentElement.classList.add('dark');
+    } else {
+      document.documentElement.classList.remove('dark');
+    }
+    localStorage.setItem('darkMode', JSON.stringify(darkMode));
+  }, [darkMode]);
 
-  const toggleTheme = () => {
-    setTheme(prev => prev === 'light' ? 'dark' : 'light');
-  };
-
-  // Check API connection on mount
+  // Initialize - load all data in parallel
   useEffect(() => {
-    checkAPIHealth();
-    loadSessions();
+    initializeApp();
   }, []);
 
-  const checkAPIHealth = async () => {
+  const initializeApp = useCallback(async () => {
     try {
-      const health = await chatAPI.checkHealth();
-      setApiConnected(health.status === 'healthy');
-      if (health.status === 'healthy') {
-        loadStats();
+      // Load health, stats, sessions, and topics in parallel
+      const [healthResult, statsResult, sessionsResult, topicsResult] = await Promise.allSettled([
+        chatAPI.checkHealth(),
+        chatAPI.getStatistics(),
+        sessionAPI.listSessions(50),
+        topicAPI.listTopics(),
+      ]);
+
+      // Process health
+      if (healthResult.status === 'fulfilled' && healthResult.value.status === 'healthy') {
+        setApiConnected(true);
+      } else {
+        setApiConnected(false);
+      }
+
+      // Process stats
+      if (statsResult.status === 'fulfilled') {
+        setStats(statsResult.value);
+      }
+
+      // Process sessions
+      if (sessionsResult.status === 'fulfilled') {
+        setSessions(sessionsResult.value.sessions || []);
+      }
+
+      // Process topics (auto-discovered from document folders)
+      if (topicsResult.status === 'fulfilled') {
+        setAvailableTopics(topicsResult.value.topics || []);
+        console.log('[TOPICS] Available topics:', topicsResult.value.topics);
       }
     } catch (error) {
-      console.error('API not reachable:', error);
+      console.error('Error initializing app:', error);
       setApiConnected(false);
     }
-  };
+  }, []);
 
-  const loadStats = async () => {
+  const loadStats = useCallback(async () => {
     try {
       const newStats = await chatAPI.getStatistics();
       setStats(newStats);
     } catch (error) {
       console.error('Error fetching stats:', error);
     }
-  };
+  }, []);
 
-  const loadSessions = async () => {
+  const loadSessions = useCallback(async () => {
     try {
       const result = await sessionAPI.listSessions(50);
       setSessions(result.sessions || []);
     } catch (error) {
       console.error('Error loading sessions:', error);
     }
-  };
+  }, []);
 
-  const startNewChat = async () => {
+  const handleNewChat = async () => {
     try {
-      // Create a new session on the backend
       const session = await sessionAPI.createSession();
       setCurrentSessionId(session.id);
       setMessages([]);
-      loadSessions(); // Refresh session list
+      loadSessions();
     } catch (error) {
       console.error('Error creating session:', error);
-      // Fallback: just clear messages locally
       setMessages([]);
       setCurrentSessionId(null);
     }
   };
 
-  const loadSession = async (session) => {
+  const handleSelectSession = async (session) => {
     try {
       setCurrentSessionId(session.id);
       const sessionData = await sessionAPI.getSession(session.id);
 
-      // Convert messages to the format expected by the chat window
       const loadedMessages = [];
       for (const msg of sessionData.messages) {
         loadedMessages.push({
@@ -119,8 +155,7 @@ function App() {
     }
   };
 
-  const handleDeleteSession = async (sessionId, e) => {
-    e.stopPropagation();
+  const handleDeleteSession = async (sessionId) => {
     try {
       await sessionAPI.deleteSession(sessionId);
       setSessions(prev => prev.filter(s => s.id !== sessionId));
@@ -130,6 +165,20 @@ function App() {
       }
     } catch (error) {
       console.error('Error deleting session:', error);
+    }
+  };
+
+  const handleClearHistory = async () => {
+    if (window.confirm('Are you sure you want to clear all chat history?')) {
+      try {
+        await chatAPI.clearChatHistory();
+        setMessages([]);
+        setSessions([]);
+        setCurrentSessionId(null);
+        loadStats();
+      } catch (error) {
+        console.error('Error clearing history:', error);
+      }
     }
   };
 
@@ -155,7 +204,6 @@ function App() {
       timestamp: new Date().toISOString(),
     };
 
-    // Create placeholder for assistant message
     const assistantPlaceholder = {
       id: Date.now() + 1,
       type: 'assistant',
@@ -166,19 +214,22 @@ function App() {
       timestamp: new Date().toISOString(),
     };
 
-    setMessages((prev) => [...prev, userMessage, assistantPlaceholder]);
+    setMessages(prev => [...prev, userMessage, assistantPlaceholder]);
     setLoading(true);
     streamingMessageRef.current = assistantPlaceholder.id;
 
     try {
-      // Use streaming API
+      // Pass selected topics to filter the search
+      const topicsFilter = selectedTopics.length > 0 ? selectedTopics : null;
+
       await chatAPI.sendMessageStream(
         text,
         sessionId,
+        topicsFilter,
         // onToken
         (token) => {
-          setMessages((prev) =>
-            prev.map((msg) =>
+          setMessages(prev =>
+            prev.map(msg =>
               msg.id === streamingMessageRef.current
                 ? { ...msg, text: msg.text + token }
                 : msg
@@ -188,8 +239,8 @@ function App() {
         // onSources
         (sources) => {
           pendingSourcesRef.current = sources;
-          setMessages((prev) =>
-            prev.map((msg) =>
+          setMessages(prev =>
+            prev.map(msg =>
               msg.id === streamingMessageRef.current
                 ? { ...msg, sources }
                 : msg
@@ -198,71 +249,76 @@ function App() {
         },
         // onImages
         (images) => {
-          console.log('[App] Received images, storing in ref:', images);
           pendingImagesRef.current = images;
         },
         // onDone
         () => {
-          const finalImages = [...pendingImagesRef.current]; // Copy arrays
+          const finalImages = [...pendingImagesRef.current];
           const finalSources = [...pendingSourcesRef.current];
-          const targetId = streamingMessageRef.current; // Capture ID before any async ops
+          const targetId = streamingMessageRef.current;
 
-          console.log('[App] Stream done - targetId:', targetId, 'images:', finalImages);
+          setMessages(prev =>
+            prev.map(msg =>
+              msg.id === targetId
+                ? { ...msg, isStreaming: false, images: finalImages, sources: finalSources }
+                : msg
+            )
+          );
 
-          setMessages((prev) => {
-            console.log('[App] Inside setMessages, looking for ID:', targetId);
-            return prev.map((msg) => {
-              if (msg.id === targetId) {
-                console.log('[App] MATCH! Applying images:', finalImages.length);
-                return {
-                  ...msg,
-                  isStreaming: false,
-                  images: finalImages,
-                  sources: finalSources
-                };
-              }
-              return msg;
-            });
-          });
-
-          // Clear refs AFTER state update is queued
+          setLoading(false);
           setTimeout(() => {
             pendingImagesRef.current = [];
             pendingSourcesRef.current = [];
             streamingMessageRef.current = null;
           }, 100);
 
-          loadSessions();
+          // Update session in list without full reload (optimization)
+          if (sessionId) {
+            setSessions(prev => {
+              const updated = prev.map(s =>
+                s.id === sessionId
+                  ? { ...s, updated_at: new Date().toISOString(), message_count: (s.message_count || 0) + 1 }
+                  : s
+              );
+              // Move updated session to top
+              const session = updated.find(s => s.id === sessionId);
+              if (session) {
+                return [session, ...updated.filter(s => s.id !== sessionId)];
+              }
+              return updated;
+            });
+          }
+          // Only reload stats (lightweight)
           loadStats();
         },
         // onError
         (error) => {
-          setMessages((prev) =>
-            prev.map((msg) =>
+          setMessages(prev =>
+            prev.map(msg =>
               msg.id === streamingMessageRef.current
                 ? { ...msg, text: `Error: ${error}`, isError: true, isStreaming: false }
                 : msg
             )
           );
+          setLoading(false);
           streamingMessageRef.current = null;
         }
       );
     } catch (error) {
       console.error('Error sending message:', error);
-      setMessages((prev) =>
-        prev.map((msg) =>
+      setMessages(prev =>
+        prev.map(msg =>
           msg.id === streamingMessageRef.current
             ? {
                 ...msg,
-                text: `Error: ${error.message || 'Unable to process your message.'}`,
-                isError: true,
+                text: msg.text || `Error: ${error.message || 'Unable to process your message.'}`,
+                isError: !msg.text,
                 isStreaming: false,
               }
             : msg
         )
       );
       streamingMessageRef.current = null;
-    } finally {
       setLoading(false);
     }
   };
@@ -270,14 +326,11 @@ function App() {
   const handleRegenerateResponse = async () => {
     if (messages.length < 2 || loading) return;
 
-    // Get the last user message
     const lastUserMsg = [...messages].reverse().find(m => m.type === 'user');
     if (!lastUserMsg) return;
 
-    // Remove the last assistant message
     setMessages(prev => prev.slice(0, -1));
 
-    // Create new placeholder
     const assistantPlaceholder = {
       id: Date.now(),
       type: 'assistant',
@@ -293,12 +346,15 @@ function App() {
     streamingMessageRef.current = assistantPlaceholder.id;
 
     try {
+      const topicsFilter = selectedTopics.length > 0 ? selectedTopics : null;
+
       await chatAPI.sendMessageStream(
         lastUserMsg.text,
         currentSessionId,
+        topicsFilter,
         (token) => {
-          setMessages((prev) =>
-            prev.map((msg) =>
+          setMessages(prev =>
+            prev.map(msg =>
               msg.id === streamingMessageRef.current
                 ? { ...msg, text: msg.text + token }
                 : msg
@@ -306,8 +362,9 @@ function App() {
           );
         },
         (sources) => {
-          setMessages((prev) =>
-            prev.map((msg) =>
+          pendingSourcesRef.current = sources;
+          setMessages(prev =>
+            prev.map(msg =>
               msg.id === streamingMessageRef.current
                 ? { ...msg, sources }
                 : msg
@@ -315,284 +372,114 @@ function App() {
           );
         },
         (images) => {
-          setMessages((prev) =>
-            prev.map((msg) =>
-              msg.id === streamingMessageRef.current
-                ? { ...msg, images }
-                : msg
-            )
-          );
+          pendingImagesRef.current = images;
         },
         () => {
-          setMessages((prev) =>
-            prev.map((msg) =>
-              msg.id === streamingMessageRef.current
-                ? { ...msg, isStreaming: false }
+          const finalImages = [...pendingImagesRef.current];
+          const finalSources = [...pendingSourcesRef.current];
+          const targetId = streamingMessageRef.current;
+
+          setMessages(prev =>
+            prev.map(msg =>
+              msg.id === targetId
+                ? { ...msg, isStreaming: false, images: finalImages, sources: finalSources }
                 : msg
             )
           );
-          streamingMessageRef.current = null;
+          setLoading(false);
+          loadStats(); // Only reload stats, not sessions
+          setTimeout(() => {
+            pendingImagesRef.current = [];
+            pendingSourcesRef.current = [];
+            streamingMessageRef.current = null;
+          }, 100);
         },
         (error) => {
-          setMessages((prev) =>
-            prev.map((msg) =>
+          setMessages(prev =>
+            prev.map(msg =>
               msg.id === streamingMessageRef.current
                 ? { ...msg, text: `Error: ${error}`, isError: true, isStreaming: false }
                 : msg
             )
           );
+          setLoading(false);
           streamingMessageRef.current = null;
         }
       );
     } catch (error) {
-      setMessages((prev) =>
-        prev.map((msg) =>
+      setMessages(prev =>
+        prev.map(msg =>
           msg.id === streamingMessageRef.current
-            ? { ...msg, text: `Error: ${error.message}`, isError: true, isStreaming: false }
+            ? { ...msg, text: msg.text || `Error: ${error.message}`, isError: !msg.text, isStreaming: false }
             : msg
         )
       );
-      streamingMessageRef.current = null;
-    } finally {
       setLoading(false);
+      streamingMessageRef.current = null;
     }
   };
 
-  const handleClearHistory = async () => {
-    if (window.confirm('Are you sure you want to clear all chat history and sessions?')) {
-      try {
-        await chatAPI.clearChatHistory();
-        setMessages([]);
-        setSessions([]);
-        setCurrentSessionId(null);
-        loadStats();
-      } catch (error) {
-        console.error('Error clearing history:', error);
+  const toggleDarkMode = () => setDarkMode(prev => !prev);
+  const toggleSidebar = () => setSidebarOpen(prev => !prev);
+
+  // Memoize callbacks to prevent unnecessary re-renders
+  const handleCloseSidebar = useCallback(() => setSidebarOpen(false), []);
+
+  // Handle topic selection (multi-select support)
+  const handleToggleTopic = useCallback((topic) => {
+    setSelectedTopics(prev => {
+      if (prev.includes(topic)) {
+        return prev.filter(t => t !== topic);
+      } else {
+        return [...prev, topic];
       }
-    }
-  };
+    });
+  }, []);
 
-  const handleCopyMessage = (text) => {
-    navigator.clipboard.writeText(text);
-  };
-
-  const handleShareChat = () => {
-    const chatText = messages.map(m =>
-      `${m.type === 'user' ? 'You' : 'Assistant'}: ${m.text}`
-    ).join('\n\n');
-    navigator.clipboard.writeText(chatText);
-    alert('Chat copied to clipboard!');
-  };
-
-  // Group sessions by date
-  const groupedSessions = groupSessionsByDate(sessions);
+  const handleClearTopics = useCallback(() => {
+    setSelectedTopics([]);
+  }, []);
 
   return (
-    <div className="app-container">
-      {/* SIDEBAR */}
-      <aside className={`sidebar ${sidebarOpen ? 'open' : 'closed'}`}>
-        <div className="sidebar-header">
-          <button className="new-chat-btn" onClick={startNewChat}>
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <line x1="12" y1="5" x2="12" y2="19"></line>
-              <line x1="5" y1="12" x2="19" y2="12"></line>
-            </svg>
-            New Chat
-          </button>
-        </div>
-
-        <nav className="sidebar-nav">
-          {Object.entries(groupedSessions).map(([group, groupSessions]) => (
-            groupSessions.length > 0 && (
-              <div key={group} className="chat-group">
-                <h3 className="chat-group-title">{group}</h3>
-                <ul className="chat-list">
-                  {groupSessions.map((session) => (
-                    <li
-                      key={session.id}
-                      className={`chat-item ${currentSessionId === session.id ? 'active' : ''}`}
-                      onClick={() => loadSession(session)}
-                    >
-                      <svg className="chat-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                        <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
-                      </svg>
-                      <span className="chat-title">{session.title?.substring(0, 30) || 'Chat'}...</span>
-                      <div className="chat-actions">
-                        <button
-                          className="chat-action-btn"
-                          onClick={(e) => handleDeleteSession(session.id, e)}
-                          title="Delete"
-                        >
-                          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                            <polyline points="3 6 5 6 21 6"></polyline>
-                            <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
-                          </svg>
-                        </button>
-                      </div>
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            )
-          ))}
-        </nav>
-
-        <div className="sidebar-footer">
-          <div className="stats-bar">
-            <div className="stat-item" title="Documents">
-              <span className="stat-icon">D</span>
-              <span>{stats.indexed_documents}</span>
-            </div>
-            <div className="stat-item" title="Images">
-              <span className="stat-icon">I</span>
-              <span>{stats.indexed_images}</span>
-            </div>
-            <div className="stat-item" title="Messages">
-              <span className="stat-icon">M</span>
-              <span>{stats.chat_messages}</span>
-            </div>
-          </div>
-
-          <button className="sidebar-btn" onClick={handleClearHistory}>
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <polyline points="3 6 5 6 21 6"></polyline>
-              <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
-            </svg>
-            Clear All
-          </button>
-
-          <div className="user-profile">
-            <div className="user-avatar">
-              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path>
-                <circle cx="12" cy="7" r="4"></circle>
-              </svg>
-            </div>
-            <span className="user-name">User</span>
-            <div className={`status-dot ${apiConnected ? 'connected' : 'disconnected'}`}></div>
-          </div>
-        </div>
-      </aside>
-
-      {/* MAIN CONTENT */}
-      <main className="main-content">
-        <header className="chat-header">
-          <div className="header-left">
-            <button className="menu-btn" onClick={() => setSidebarOpen(!sidebarOpen)}>
-              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                <line x1="3" y1="12" x2="21" y2="12"></line>
-                <line x1="3" y1="6" x2="21" y2="6"></line>
-                <line x1="3" y1="18" x2="21" y2="18"></line>
-              </svg>
-            </button>
-            <h1 className="header-title">KM Portal</h1>
-            <span className="header-model">Document Assistant</span>
-          </div>
-          <div className="header-right">
-            <button className="theme-toggle" onClick={toggleTheme} title={theme === 'light' ? 'Switch to Dark Mode' : 'Switch to Light Mode'}>
-              {theme === 'light' ? (
-                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                  <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path>
-                </svg>
-              ) : (
-                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                  <circle cx="12" cy="12" r="5"></circle>
-                  <line x1="12" y1="1" x2="12" y2="3"></line>
-                  <line x1="12" y1="21" x2="12" y2="23"></line>
-                  <line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line>
-                  <line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line>
-                  <line x1="1" y1="12" x2="3" y2="12"></line>
-                  <line x1="21" y1="12" x2="23" y2="12"></line>
-                  <line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line>
-                  <line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line>
-                </svg>
-              )}
-            </button>
-            <button className="header-btn" onClick={handleShareChat} title="Share">
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                <circle cx="18" cy="5" r="3"></circle>
-                <circle cx="6" cy="12" r="3"></circle>
-                <circle cx="18" cy="19" r="3"></circle>
-                <line x1="8.59" y1="13.51" x2="15.42" y2="17.49"></line>
-                <line x1="15.41" y1="6.51" x2="8.59" y2="10.49"></line>
-              </svg>
-            </button>
-            <button className="header-btn" onClick={() => setSettingsOpen(true)} title="Settings">
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                <circle cx="12" cy="12" r="3"></circle>
-                <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
-              </svg>
-            </button>
-          </div>
-        </header>
-
-        <ChatWindow
-          messages={messages}
-          loading={loading}
-          onSendMessage={handleSendMessage}
-          apiConnected={apiConnected}
-          onCopyMessage={handleCopyMessage}
-          onRegenerate={handleRegenerateResponse}
-        />
-
-        {!apiConnected && (
-          <div className="connection-warning">
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <circle cx="12" cy="12" r="10"></circle>
-              <line x1="12" y1="8" x2="12" y2="12"></line>
-              <line x1="12" y1="16" x2="12.01" y2="16"></line>
-            </svg>
-            Backend not connected. Run: <code>uvicorn main:app --reload</code>
-          </div>
-        )}
-      </main>
-
-      {/* Settings Modal */}
-      <SettingsModal
-        isOpen={settingsOpen}
-        onClose={() => setSettingsOpen(false)}
+    <div className="h-screen flex overflow-hidden bg-white dark:bg-dark-bg transition-colors duration-300">
+      {/* Sidebar */}
+      <MemoizedSidebar
+        isOpen={sidebarOpen}
+        sessions={sessions}
+        currentSessionId={currentSessionId}
         stats={stats}
+        onNewChat={handleNewChat}
+        onSelectSession={handleSelectSession}
+        onDeleteSession={handleDeleteSession}
+        onClearHistory={handleClearHistory}
+        onClose={handleCloseSidebar}
+      />
+
+      {/* Mobile overlay */}
+      {sidebarOpen && (
+        <div
+          className="fixed inset-0 bg-black/50 dark:bg-black/70 backdrop-blur-sm z-30 lg:hidden"
+          onClick={handleCloseSidebar}
+        />
+      )}
+
+      {/* Main Chat Area */}
+      <MemoizedChatArea
+        messages={messages}
+        loading={loading}
+        apiConnected={apiConnected}
+        darkMode={darkMode}
+        availableTopics={availableTopics}
+        selectedTopics={selectedTopics}
+        onSendMessage={handleSendMessage}
+        onRegenerate={handleRegenerateResponse}
+        onToggleDarkMode={toggleDarkMode}
+        onToggleSidebar={toggleSidebar}
+        onToggleTopic={handleToggleTopic}
+        onClearTopics={handleClearTopics}
       />
     </div>
   );
-}
-
-// Helper function to group sessions by date
-function groupSessionsByDate(sessions) {
-  const groups = {
-    'Today': [],
-    'Yesterday': [],
-    'Previous 7 Days': [],
-    'Previous 30 Days': [],
-    'Older': [],
-  };
-
-  const now = new Date();
-  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-  const yesterday = new Date(today);
-  yesterday.setDate(yesterday.getDate() - 1);
-  const weekAgo = new Date(today);
-  weekAgo.setDate(weekAgo.getDate() - 7);
-  const monthAgo = new Date(today);
-  monthAgo.setDate(monthAgo.getDate() - 30);
-
-  sessions.forEach(session => {
-    const sessionDate = new Date(session.updated_at || session.created_at);
-
-    if (sessionDate >= today) {
-      groups['Today'].push(session);
-    } else if (sessionDate >= yesterday) {
-      groups['Yesterday'].push(session);
-    } else if (sessionDate >= weekAgo) {
-      groups['Previous 7 Days'].push(session);
-    } else if (sessionDate >= monthAgo) {
-      groups['Previous 30 Days'].push(session);
-    } else {
-      groups['Older'].push(session);
-    }
-  });
-
-  return groups;
 }
 
 export default App;

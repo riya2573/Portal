@@ -1,14 +1,20 @@
 {
-  "name": "document-chatbot-frontend",
-  "version": "1.0.0",
-  "description": "Document-based chatbot UI",
+  "name": "km-portal-frontend",
+  "version": "2.0.0",
+  "description": "KM Portal - Premium Document Chatbot UI",
   "private": true,
   "dependencies": {
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
     "axios": "^1.6.2",
     "react-markdown": "^9.0.0",
-    "react-icons": "^4.12.0"
+    "lucide-react": "^0.294.0"
+  },
+  "devDependencies": {
+    "react-scripts": "5.0.1",
+    "tailwindcss": "^3.4.0",
+    "autoprefixer": "^10.4.16",
+    "postcss": "^8.4.32"
   },
   "scripts": {
     "start": "react-scripts start",
@@ -32,8 +38,5 @@
       "last 1 firefox version",
       "last 1 safari version"
     ]
-  },
-  "devDependencies": {
-    "react-scripts": "5.0.1"
   }
 }

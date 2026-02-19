@@ -4,11 +4,6 @@ python-multipart==0.0.6
 pydantic==2.9.0
 pydantic-settings==2.2.1
 chromadb==0.4.22
-onnxruntime==1.16.3
-torch==2.1.2
-sentence-transformers==2.2.2
-transformers==4.36.2
-huggingface_hub==0.20.3
 ollama==0.6.1
 sqlalchemy==2.0.25
 python-dotenv==1.0.0

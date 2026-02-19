@@ -16,7 +16,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-from config import FRONTEND_URL, DB_PATH, IMAGES_DIR, DOCUMENTS_DIR
+from config import FRONTEND_URL, DB_PATH, IMAGES_DIR, DOCUMENTS_DIR, get_available_topics, DEFAULT_TOPIC
 from embeddings import get_embeddings_service
 from vector_store import get_vector_store
 from llm_service import get_llm_service
@@ -39,6 +39,7 @@ app.add_middleware(
 class Message(BaseModel):
     text: str
     session_id: Optional[str] = None
+    topics: Optional[List[str]] = None  # Topic filters (multi-select)
 
 
 class ChatResponse(BaseModel):
@@ -156,6 +157,24 @@ async def health_check():
         documents_indexed=stats["text_documents"],
         images_indexed=stats["images"],
     )
+
+
+@app.get("/topics")
+async def list_topics():
+    """
+    Get available topic filters.
+    Topics are automatically derived from subfolder names in the documents directory.
+    """
+    try:
+        topics = get_available_topics()
+        return {
+            "topics": topics,
+            "total": len(topics),
+            "default_topic": DEFAULT_TOPIC,
+            "message": "Topics are auto-discovered from subfolders in data/documents/"
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # =============================================================================
@@ -334,10 +353,13 @@ async def delete_session(session_id: str):
 async def chat(message: Message):
     """
     Main chat endpoint
-    Retrieves documents, generates answer, and finds relevant images
+    - For image-only requests: Returns only images, no text answer
+    - For questions: Returns text answer with relevant images
+    - Supports topic filtering via message.topics
     """
     user_query = message.text.strip()
     session_id = message.session_id
+    topics = message.topics  # Topic filters (can be None or list)
 
     if not user_query:
         raise HTTPException(status_code=400, detail="Empty message")
@@ -352,54 +374,103 @@ async def chat(message: Message):
         response_sources = []
         answer = ""
 
-        # Step 1: Search for text content
-        text_chunks, text_metadata = vector_store.search_text(user_query)
+        # Log topic filter if used
+        if topics:
+            print(f"  [FILTER] Topic filter active: {topics}")
 
-        if text_chunks:
-            # Prepare context from retrieved documents
-            context = _format_context(text_chunks, text_metadata)
+        # Detect intent: image-only request or question
+        is_image_request = _is_image_only_request(user_query)
 
-            # Extract page numbers and add to source metadata
-            response_sources = _enrich_sources_with_pages(text_chunks, text_metadata)
+        if is_image_request:
+            # IMAGE-ONLY MODE: Skip LLM, just find images
+            print(f"  [INTENT] Image-only request detected: '{user_query}'")
 
-            # Generate answer
-            answer = llm_service.generate_answer(context, user_query)
+            # Search for relevant context to help find images (with topic filter)
+            text_chunks, text_metadata = vector_store.search_text(user_query, topics=topics)
 
-            # Step 2: Find relevant images - try to find up to 3
+            stop_words = {'what', 'is', 'the', 'a', 'an', 'how', 'does', 'show', 'me', 'explain', 'about', 'and', 'or', 'of', 'in', 'to', 'for', 'display', 'image', 'picture', 'diagram', 'figure'}
+            query_words = re.findall(r'\b[a-zA-Z]{3,}\b', user_query.lower())
+            search_terms = [w for w in query_words if w not in stop_words]
+
             if text_metadata:
                 doc_name = text_metadata[0].get('document_name', '')
-                stop_words = {'what', 'is', 'the', 'a', 'an', 'how', 'does', 'show', 'me', 'explain', 'about', 'and', 'or', 'of', 'in', 'to', 'for'}
-                query_words = re.findall(r'\b[a-zA-Z]{3,}\b', user_query.lower())
-                search_terms = [w for w in query_words if w not in stop_words]
-
                 page_numbers = []
                 for chunk in text_chunks[:5]:
-                    # Check for PDF pages
                     page_matches = re.findall(r'\[Page\s*(\d+)\]', chunk)
                     for match in page_matches:
                         page_numbers.append(int(match))
-                    # Also check for PPTX slides
                     slide_matches = re.findall(r'\[Slide\s*(\d+)\]', chunk)
                     for match in slide_matches:
                         page_numbers.append(int(match))
-
                 page_numbers = list(set([p for p in page_numbers if p > 0]))[:15]
 
-                # Combine text chunks to search for figure references
                 combined_text = ' '.join(text_chunks[:5])
 
-                # Get up to 3 relevant images
                 relevant_images = image_extractor.find_relevant_images(
-                    doc_name, page_numbers, search_terms, text_content=combined_text, max_images=3
+                    doc_name, page_numbers, search_terms, text_content=combined_text, max_images=3, query=user_query
                 )
                 if relevant_images:
                     response_images = [{
                         "image_id": img["id"],
                         "document_name": img["document_name"],
-                        "page_number": img["page_number"]
+                        "page_number": img["page_number"],
+                        "figure_caption": img.get("figure_caption", "")
                     } for img in relevant_images]
+                    # No text answer for image-only requests
+                    answer = ""
+                else:
+                    answer = "I couldn't find any relevant images for your request."
+            else:
+                answer = "I couldn't find any relevant images for your request."
+
         else:
-            answer = "I couldn't find any relevant information in the documents to answer your question."
+            # QUESTION MODE: Generate text answer + find images
+            print(f"  [INTENT] Question detected: '{user_query}'")
+
+            # Step 1: Search for text content (with topic filter)
+            text_chunks, text_metadata = vector_store.search_text(user_query, topics=topics)
+
+            if text_chunks:
+                # Prepare context from retrieved documents
+                context = _format_context(text_chunks, text_metadata)
+
+                # Extract page numbers and add to source metadata
+                response_sources = _enrich_sources_with_pages(text_chunks, text_metadata)
+
+                # Generate answer
+                answer = llm_service.generate_answer(context, user_query)
+
+                # Step 2: Find relevant images - try to find up to 3
+                if text_metadata:
+                    doc_name = text_metadata[0].get('document_name', '')
+                    stop_words = {'what', 'is', 'the', 'a', 'an', 'how', 'does', 'show', 'me', 'explain', 'about', 'and', 'or', 'of', 'in', 'to', 'for'}
+                    query_words = re.findall(r'\b[a-zA-Z]{3,}\b', user_query.lower())
+                    search_terms = [w for w in query_words if w not in stop_words]
+
+                    page_numbers = []
+                    for chunk in text_chunks[:5]:
+                        page_matches = re.findall(r'\[Page\s*(\d+)\]', chunk)
+                        for match in page_matches:
+                            page_numbers.append(int(match))
+                        slide_matches = re.findall(r'\[Slide\s*(\d+)\]', chunk)
+                        for match in slide_matches:
+                            page_numbers.append(int(match))
+
+                    page_numbers = list(set([p for p in page_numbers if p > 0]))[:15]
+
+                    combined_text = ' '.join(text_chunks[:5])
+
+                    relevant_images = image_extractor.find_relevant_images(
+                        doc_name, page_numbers, search_terms, text_content=combined_text, max_images=3, query=user_query
+                    )
+                    if relevant_images:
+                        response_images = [{
+                            "image_id": img["id"],
+                            "document_name": img["document_name"],
+                            "page_number": img["page_number"]
+                        } for img in relevant_images]
+            else:
+                answer = "I couldn't find any relevant information in the documents to answer your question."
 
         # Step 3: Save to chat history
         _save_chat_history(user_query, answer, response_sources, response_images, session_id)
@@ -424,90 +495,155 @@ async def chat(message: Message):
 async def chat_stream(message: Message):
     """
     Streaming chat endpoint - returns tokens as Server-Sent Events
+    - For image-only requests: Returns only images, no text streaming
+    - For questions: Streams text answer with relevant images
+    - Supports topic filtering via message.topics
     """
     user_query = message.text.strip()
     session_id = message.session_id
+    topics = message.topics  # Topic filters (can be None or list)
 
     if not user_query:
         raise HTTPException(status_code=400, detail="Empty message")
 
+    # Detect intent outside the generator so it's available
+    is_image_request = _is_image_only_request(user_query)
+
+    # Log topic filter if used
+    if topics:
+        print(f"  [FILTER] Topic filter active (stream): {topics}")
+
     async def generate():
+        response_images = []
+        response_sources = []
+        full_answer = ""
+
         try:
             vector_store = get_vector_store()
             llm_service = get_llm_service()
             image_extractor = get_image_extractor()
 
-            response_images = []
-            response_sources = []
-            full_answer = ""
+            # Search for text content with topic filter (needed for both modes)
+            text_chunks, text_metadata = vector_store.search_text(user_query, topics=topics)
 
-            # Search for text content
-            text_chunks, text_metadata = vector_store.search_text(user_query)
+            if is_image_request:
+                # IMAGE-ONLY MODE: Skip LLM streaming, just find images
+                print(f"  [INTENT] Image-only request (stream): '{user_query}'")
 
-            if text_chunks:
-                context = _format_context(text_chunks, text_metadata)
-                response_sources = _enrich_sources_with_pages(text_chunks, text_metadata)
+                stop_words = {'what', 'is', 'the', 'a', 'an', 'how', 'does', 'show', 'me', 'explain', 'about', 'and', 'or', 'of', 'in', 'to', 'for', 'display', 'image', 'picture', 'diagram', 'figure'}
+                query_words = re.findall(r'\b[a-zA-Z]{3,}\b', user_query.lower())
+                search_terms = [w for w in query_words if w not in stop_words]
 
-                # Send sources first
-                yield f"data: {json.dumps({'type': 'sources', 'sources': response_sources})}\n\n"
-
-                # Stream the answer
-                for token in llm_service.generate_answer_stream(context, user_query):
-                    full_answer += token
-                    yield f"data: {json.dumps({'type': 'token', 'token': token})}\n\n"
-
-                # Find images - try to find up to 3
                 if text_metadata:
                     doc_name = text_metadata[0].get('document_name', '')
-                    stop_words = {'what', 'is', 'the', 'a', 'an', 'how', 'does', 'show', 'me', 'explain', 'about', 'and', 'or', 'of', 'in', 'to', 'for'}
-                    query_words = re.findall(r'\b[a-zA-Z]{3,}\b', user_query.lower())
-                    search_terms = [w for w in query_words if w not in stop_words]
-
                     page_numbers = []
                     for chunk in text_chunks[:5]:
-                        # Check for PDF pages
                         page_matches = re.findall(r'\[Page\s*(\d+)\]', chunk)
                         for match in page_matches:
                             page_numbers.append(int(match))
-                        # Also check for PPTX slides
                         slide_matches = re.findall(r'\[Slide\s*(\d+)\]', chunk)
                         for match in slide_matches:
                             page_numbers.append(int(match))
-
                     page_numbers = list(set([p for p in page_numbers if p > 0]))[:15]
 
-                    # Combine text chunks to search for figure references
                     combined_text = ' '.join(text_chunks[:5])
 
-                    # Get up to 3 relevant images
                     relevant_images = image_extractor.find_relevant_images(
-                        doc_name, page_numbers, search_terms, text_content=combined_text, max_images=3
+                        doc_name, page_numbers, search_terms, text_content=combined_text, max_images=3, query=user_query
                     )
                     if relevant_images:
                         response_images = [{
                             "image_id": img["id"],
                             "document_name": img["document_name"],
-                            "page_number": img["page_number"]
+                            "page_number": img["page_number"],
+                            "figure_caption": img.get("figure_caption", "")
                         } for img in relevant_images]
+                        # Send images immediately (no text answer)
+                        yield f"data: {json.dumps({'type': 'images', 'images': response_images})}\n\n"
+                    else:
+                        full_answer = "I couldn't find any relevant images for your request."
+                        yield f"data: {json.dumps({'type': 'token', 'token': full_answer})}\n\n"
+                else:
+                    full_answer = "I couldn't find any relevant images for your request."
+                    yield f"data: {json.dumps({'type': 'token', 'token': full_answer})}\n\n"
+
             else:
-                full_answer = "I couldn't find any relevant information in the documents to answer your question."
-                yield f"data: {json.dumps({'type': 'token', 'token': full_answer})}\n\n"
+                # QUESTION MODE: Stream text answer + find images
+                print(f"  [INTENT] Question (stream): '{user_query}'")
 
-            # Send images at the end
-            if response_images:
-                yield f"data: {json.dumps({'type': 'images', 'images': response_images})}\n\n"
+                if text_chunks:
+                    context = _format_context(text_chunks, text_metadata)
+                    response_sources = _enrich_sources_with_pages(text_chunks, text_metadata)
 
-            # Send done signal
-            yield f"data: {json.dumps({'type': 'done', 'session_id': session_id})}\n\n"
+                    # Send sources first
+                    yield f"data: {json.dumps({'type': 'sources', 'sources': response_sources})}\n\n"
 
-            # Save to history
-            _save_chat_history(user_query, full_answer, response_sources, response_images, session_id)
+                    # Stream the answer
+                    try:
+                        for token in llm_service.generate_answer_stream(context, user_query):
+                            full_answer += token
+                            yield f"data: {json.dumps({'type': 'token', 'token': token})}\n\n"
+                    except Exception as stream_error:
+                        error_msg = f"Error during generation: {str(stream_error)}"
+                        full_answer += error_msg
+                        yield f"data: {json.dumps({'type': 'token', 'token': error_msg})}\n\n"
 
-            if session_id:
-                _update_session_title_if_needed(session_id, user_query)
+                    # Find images - try to find up to 3
+                    if text_metadata:
+                        try:
+                            doc_name = text_metadata[0].get('document_name', '')
+                            stop_words = {'what', 'is', 'the', 'a', 'an', 'how', 'does', 'show', 'me', 'explain', 'about', 'and', 'or', 'of', 'in', 'to', 'for'}
+                            query_words = re.findall(r'\b[a-zA-Z]{3,}\b', user_query.lower())
+                            search_terms = [w for w in query_words if w not in stop_words]
+
+                            page_numbers = []
+                            for chunk in text_chunks[:5]:
+                                page_matches = re.findall(r'\[Page\s*(\d+)\]', chunk)
+                                for match in page_matches:
+                                    page_numbers.append(int(match))
+                                slide_matches = re.findall(r'\[Slide\s*(\d+)\]', chunk)
+                                for match in slide_matches:
+                                    page_numbers.append(int(match))
+
+                            page_numbers = list(set([p for p in page_numbers if p > 0]))[:15]
+
+                            combined_text = ' '.join(text_chunks[:5])
+
+                            relevant_images = image_extractor.find_relevant_images(
+                                doc_name, page_numbers, search_terms, text_content=combined_text, max_images=3, query=user_query
+                            )
+                            if relevant_images:
+                                response_images = [{
+                                    "image_id": img["id"],
+                                    "document_name": img["document_name"],
+                                    "page_number": img["page_number"]
+                                } for img in relevant_images]
+                        except Exception as img_error:
+                            print(f"[WARN] Error finding images: {img_error}")
+                else:
+                    full_answer = "I couldn't find any relevant information in the documents to answer your question."
+                    yield f"data: {json.dumps({'type': 'token', 'token': full_answer})}\n\n"
+
+                # Send images at the end for question mode
+                if response_images:
+                    yield f"data: {json.dumps({'type': 'images', 'images': response_images})}\n\n"
 
         except Exception as e:
-            yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
+            error_msg = str(e)
+            print(f"[ERROR] Stream error: {error_msg}")
+            yield f"data: {json.dumps({'type': 'error', 'error': error_msg})}\n\n"
+
+        # ALWAYS send done signal, even after errors
+        yield f"data: {json.dumps({'type': 'done', 'session_id': session_id})}\n\n"
+
+        # Save to history (do this after sending done to not block the response)
+        try:
+            if full_answer:
+                _save_chat_history(user_query, full_answer, response_sources, response_images, session_id)
+            if session_id:
+                _update_session_title_if_needed(session_id, user_query)
+        except Exception as save_error:
+            print(f"[ERROR] Error saving chat history: {save_error}")
 
     return StreamingResponse(
         generate(),
@@ -526,14 +662,32 @@ async def chat_stream(message: Message):
 
 @app.get("/documents/{filename:path}")
 async def get_document(filename: str):
-    """Serve a document file (PDF, DOCX, PPTX) - supports page navigation via #page=N"""
+    """Serve a document file (PDF, DOCX, PPTX) - optimized with caching"""
     try:
         # Security: prevent path traversal
-        filename = Path(filename).name
-        doc_path = DOCUMENTS_DIR / filename
+        safe_filename = Path(filename).name
+        doc_path = None
 
-        if not doc_path.exists():
+        # First check root documents directory
+        root_path = DOCUMENTS_DIR / safe_filename
+        if root_path.exists():
+            doc_path = root_path
+        else:
+            # Search in topic subfolders
+            for topic_dir in DOCUMENTS_DIR.iterdir():
+                if topic_dir.is_dir():
+                    subfolder_path = topic_dir / safe_filename
+                    if subfolder_path.exists():
+                        doc_path = subfolder_path
+                        break
+
+        if not doc_path or not doc_path.exists():
             raise HTTPException(status_code=404, detail=f"Document not found: {filename}")
+
+        # Get file stats for caching
+        file_stat = doc_path.stat()
+        file_size = file_stat.st_size
+        last_modified = datetime.fromtimestamp(file_stat.st_mtime).strftime('%a, %d %b %Y %H:%M:%S GMT')
 
         # Detect media type
         ext = doc_path.suffix.lower()
@@ -551,6 +705,10 @@ async def get_document(filename: str):
             filename=filename,
             headers={
                 "Content-Disposition": f"inline; filename=\"{filename}\"",
+                "Cache-Control": "public, max-age=86400",  # Cache for 24 hours
+                "Last-Modified": last_modified,
+                "Accept-Ranges": "bytes",  # Enable partial content for large files
+                "Content-Length": str(file_size),
             }
         )
     except HTTPException:
@@ -565,7 +723,7 @@ async def get_document(filename: str):
 
 @app.get("/images/{image_id}")
 async def get_image(image_id: int):
-    """Get an image by ID"""
+    """Get an image by ID - optimized with caching"""
     try:
         image_extractor = get_image_extractor()
         image_data = image_extractor.get_image_by_id(image_id)
@@ -594,6 +752,7 @@ async def get_image(image_id: int):
             headers={
                 "X-Document": image_data.get("document_name", "Unknown"),
                 "X-Page": str(image_data.get("page_number", 0)),
+                "Cache-Control": "public, max-age=604800",  # Cache images for 7 days
             },
         )
 
@@ -726,6 +885,65 @@ async def get_statistics():
 # HELPER METHODS
 # =============================================================================
 
+def _is_image_only_request(query: str) -> bool:
+    """
+    Detect if the user is asking specifically for an image/diagram/figure.
+
+    Returns True for queries like:
+    - "show me the valve diagram"
+    - "display the pump figure"
+    - "image of ball valve"
+    - "picture of the assembly"
+    - "diagram for gate valve"
+
+    Returns False for questions like:
+    - "what is a ball valve?"
+    - "how does a pump work?"
+    - "explain the valve operation"
+    """
+    query_lower = query.lower().strip()
+
+    # Patterns that indicate image-only request
+    image_request_patterns = [
+        r'^show\s+(me\s+)?(the\s+|a\s+)?',
+        r'^display\s+(the\s+|a\s+)?',
+        r'^(get|find|fetch)\s+(me\s+)?(the\s+|a\s+)?.*?(image|picture|diagram|figure|photo|illustration)',
+        r'^image\s+of\b',
+        r'^picture\s+of\b',
+        r'^diagram\s+(of|for)\b',
+        r'^figure\s+(of|for)\b',
+        r'^(can\s+you\s+)?show\b',
+        r'\b(show|display|give)\s+(me\s+)?(the\s+|a\s+)?(image|picture|diagram|figure|illustration)\b',
+    ]
+
+    # Keywords that strongly indicate image request (at start or as main intent)
+    image_keywords_start = ['show', 'display', 'image', 'picture', 'diagram', 'figure', 'illustration', 'photo']
+
+    # Check if query starts with image-related word
+    first_word = query_lower.split()[0] if query_lower.split() else ""
+    if first_word in image_keywords_start:
+        # But check it's not a question about images
+        if not any(q in query_lower for q in ['what is', 'how to', 'why', 'explain', 'describe', 'tell me about']):
+            return True
+
+    # Check patterns
+    for pattern in image_request_patterns:
+        if re.search(pattern, query_lower):
+            # Make sure it's not also asking a question
+            if not any(q in query_lower for q in ['?', 'what is', 'how does', 'why', 'explain', 'describe']):
+                return True
+
+    # Check for "X diagram" or "X image" pattern (e.g., "valve diagram", "pump image")
+    if re.search(r'\b(diagram|image|picture|figure|illustration)\s*$', query_lower):
+        return True
+
+    # Check for "diagram of X" or "image of X" anywhere
+    if re.search(r'\b(diagram|image|picture|figure|illustration)\s+(of|for)\s+', query_lower):
+        return True
+
+    return False
+
+
 def _format_context(texts: List[str], metadatas: List[dict]) -> str:
     """Format retrieved documents into context"""
     context_parts = []
@@ -740,34 +958,31 @@ def _format_context(texts: List[str], metadatas: List[dict]) -> str:
 
 
 def _enrich_sources_with_pages(texts: List[str], metadatas: List[dict]) -> List[dict]:
-    """Extract page numbers from text chunks and add to source metadata, with deduplication"""
+    """Extract page numbers from metadata with deduplication - optimized version"""
     seen_sources = {}  # Key: (document_name, page_number), Value: source dict
 
     for text, metadata in zip(texts, metadatas):
         source = dict(metadata)  # Copy metadata
         doc_name = source.get('document_name', 'Unknown')
 
-        # First, check if page_number is already in metadata (from ingestion)
-        if 'page_number' in source and source['page_number']:
-            page_number = source['page_number']
-        else:
-            # Fallback: Try to extract page number from the text chunk
-            # Check for PDF format: [Page X]
+        # Use page_number from metadata (now accurately tracked during ingestion)
+        page_number = source.get('page_number', 0)
+
+        # If still no page number, try to extract from text as last resort
+        if not page_number or page_number == 0:
+            # Check for page markers in text
             page_matches = re.findall(r'\[Page\s*(\d+)\]', text)
             if page_matches:
                 page_number = int(page_matches[0])
             else:
-                # Check for PPTX format: [Slide X]
                 slide_matches = re.findall(r'\[Slide\s*(\d+)\]', text)
                 if slide_matches:
                     page_number = int(slide_matches[0])
                 else:
-                    # Last resort: look for "page X" anywhere
-                    page_matches = re.findall(r'page\s*(\d+)', text.lower())
-                    if page_matches:
-                        page_number = int(page_matches[0])
-                    else:
-                        page_number = 1  # Default
+                    # Extract chunk_index and estimate page (rough fallback)
+                    chunk_idx = source.get('chunk_index', 0)
+                    # Estimate: ~2 chunks per page on average
+                    page_number = max(1, (chunk_idx // 2) + 1)
 
         source['page_number'] = page_number
 

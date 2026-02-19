@@ -80,15 +80,60 @@ export const chatAPI = {
     }
   },
 
-  // Send message with streaming response
-  sendMessageStream: async (text, sessionId = null, onToken, onSources, onImages, onDone, onError) => {
+  // Send message with streaming response (supports topic filtering)
+  sendMessageStream: async (text, sessionId = null, topics = null, onToken, onSources, onImages, onDone, onError) => {
+    let doneReceived = false;
+
+    const processLine = (line) => {
+      if (line.startsWith('data: ')) {
+        try {
+          const data = JSON.parse(line.slice(6));
+
+          switch (data.type) {
+            case 'token':
+              if (onToken) onToken(data.token);
+              break;
+            case 'sources':
+              console.log('[API] Received sources:', data.sources);
+              if (onSources) onSources(data.sources);
+              break;
+            case 'images':
+              console.log('[API] Received images:', data.images);
+              if (onImages) onImages(data.images);
+              break;
+            case 'done':
+              console.log('[API] Stream done');
+              doneReceived = true;
+              if (onDone) onDone(data.session_id);
+              break;
+            case 'error':
+              console.error('[API] Stream error:', data.error);
+              if (onError) onError(data.error);
+              break;
+            default:
+              console.log('[API] Unknown type:', data.type);
+              break;
+          }
+        } catch (e) {
+          // Ignore JSON parse errors for incomplete data
+        }
+      }
+    };
+
     try {
+      // Build request body with optional topics filter
+      const requestBody = { text, session_id: sessionId };
+      if (topics && topics.length > 0) {
+        requestBody.topics = topics;
+        console.log('[API] Sending with topic filter:', topics);
+      }
+
       const response = await fetch(`${API_BASE_URL}/chat/stream`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ text, session_id: sessionId }),
+        body: JSON.stringify(requestBody),
       });
 
       if (!response.ok) {
@@ -101,50 +146,38 @@ export const chatAPI = {
 
       while (true) {
         const { done, value } = await reader.read();
-        if (done) break;
 
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop(); // Keep incomplete line in buffer
+        if (value) {
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop(); // Keep incomplete line in buffer
 
-        for (const line of lines) {
-          if (line.startsWith('data: ')) {
-            try {
-              const data = JSON.parse(line.slice(6));
-
-              switch (data.type) {
-                case 'token':
-                  if (onToken) onToken(data.token);
-                  break;
-                case 'sources':
-                  console.log('[API] Received sources:', data.sources);
-                  if (onSources) onSources(data.sources);
-                  break;
-                case 'images':
-                  console.log('[API] Received images:', data.images);
-                  if (onImages) onImages(data.images);
-                  break;
-                case 'done':
-                  console.log('[API] Stream done');
-                  if (onDone) onDone(data.session_id);
-                  break;
-                case 'error':
-                  console.error('[API] Stream error:', data.error);
-                  if (onError) onError(data.error);
-                  break;
-                default:
-                  console.log('[API] Unknown type:', data.type);
-                  break;
-              }
-            } catch (e) {
-              // Ignore JSON parse errors for incomplete data
-            }
+          for (const line of lines) {
+            processLine(line);
           }
         }
+
+        if (done) {
+          // Process any remaining data in buffer
+          if (buffer.trim()) {
+            processLine(buffer);
+          }
+          break;
+        }
+      }
+
+      // If stream ended but 'done' event was never received, call onDone anyway
+      if (!doneReceived) {
+        console.log('[API] Stream ended without done event, calling onDone');
+        if (onDone) onDone(sessionId);
       }
     } catch (error) {
       console.error('Streaming error:', error);
       if (onError) onError(error.message);
+      // Even on error, ensure we signal completion
+      if (!doneReceived && onDone) {
+        onDone(sessionId);
+      }
       throw error;
     }
   },
@@ -262,6 +295,20 @@ export const documentAPI = {
       url += `#page=${pageNumber}`;
     }
     return url;
+  },
+};
+
+// Topic services (auto-discovered from document folders)
+export const topicAPI = {
+  // Get all available topics
+  listTopics: async () => {
+    try {
+      const response = await api.get('/topics');
+      return response.data;
+    } catch (error) {
+      console.error('Error fetching topics:', error);
+      return { topics: [], total: 0 };
+    }
   },
 };
 
