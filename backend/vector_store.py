@@ -9,7 +9,6 @@ from chromadb.config import Settings
 import sqlite3
 from typing import List, Tuple
 import numpy as np
-import os
 from config import (
     CHROMA_DB_DIR,
     COLLECTION_NAME_TEXT,

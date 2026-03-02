@@ -662,14 +662,12 @@ python-multipart==0.0.6
 pydantic==2.9.0
 pydantic-settings==2.2.1
 chromadb==0.4.22
-ollama==0.6.1
 sqlalchemy==2.0.25
 python-dotenv==1.0.0
 pillow==10.1.0
 PyPDF2==3.0.1
 python-docx==0.8.11
 python-pptx==0.6.23
-pdf2image==1.17.0
 PyMuPDF==1.23.8
 requests==2.31.0
 numpy==1.26.0
@@ -694,8 +692,8 @@ numpy==1.26.0
 }
 ```
 
-**Note:** No LLaVA, PyTorch, or sentence-transformers needed. Embeddings use Ollama's nomic-embed-text model.
+**Note:** No LLaVA, PyTorch, sentence-transformers, pdf2image, or ollama library needed. Embeddings use Ollama's nomic-embed-text model via direct HTTP requests.
 
 ---
 
-*Last Updated: February 2026 (Session 7 - Complete Documentation Update)*
+*Last Updated: March 2026 (Session 8 - Dependency Cleanup)*
