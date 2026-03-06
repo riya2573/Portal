@@ -3,13 +3,14 @@ uvicorn[standard]==0.27.0
 python-multipart==0.0.6
 pydantic==2.9.0
 pydantic-settings==2.2.1
-chromadb==0.4.22
+qdrant-client==1.9.0
 sqlalchemy==2.0.25
 python-dotenv==1.0.0
 pillow==10.1.0
-PyPDF2==3.0.1
+pypdf>=3.0.0
 python-docx==0.8.11
 python-pptx==0.6.23
 PyMuPDF==1.23.8
 requests==2.31.0
 numpy==1.26.0
+tqdm==4.66.0

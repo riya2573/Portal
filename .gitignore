@@ -10,10 +10,11 @@ backend/__pycache__/
 ####################################
 # Backend data & databases
 ####################################
-backend/data/chroma_db/
+backend/data/qdrant_db/
 backend/data/chat_history.db
 backend/data/documents/
 backend/data/extracted_images/
+backend/data/embedding_cache/
 
 ####################################
 # Vector stores / embeddings
