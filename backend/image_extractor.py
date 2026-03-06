@@ -3,10 +3,27 @@ import sqlite3
 import base64
 import requests
 import re
+import threading
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 import hashlib
-from config import IMAGES_DIR, DB_PATH, OLLAMA_API_URL, OLLAMA_TIMEOUT, DEFAULT_TOPIC
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from config import (
+    IMAGES_DIR,
+    DB_PATH,
+    OLLAMA_API_URL,
+    OLLAMA_TIMEOUT,
+    DEFAULT_TOPIC,
+    IMAGE_EXTRACTION_MAX_WORKERS,
+    SHOW_PROGRESS_BAR,
+)
+
+# Try to import tqdm for progress bars
+try:
+    from tqdm import tqdm
+    TQDM_AVAILABLE = True
+except ImportError:
+    TQDM_AVAILABLE = False
 
 try:
     import fitz  # PyMuPDF
@@ -52,6 +69,10 @@ SECTION_HEADING_PATTERNS = [
 class ImageExtractor:
     def __init__(self):
         self.images_dir = IMAGES_DIR
+        self.max_workers = IMAGE_EXTRACTION_MAX_WORKERS
+        self.show_progress = SHOW_PROGRESS_BAR and TQDM_AVAILABLE
+        # Thread-safe lock for SQLite operations
+        self._db_lock = threading.Lock()
         self._init_image_db()
 
     def _init_image_db(self):
@@ -323,9 +344,168 @@ class ImageExtractor:
     # PDF IMAGE EXTRACTION (LAYOUT-AWARE)
     # =========================================================================
 
+    def _process_pdf_page(
+        self,
+        pdf_path: str,
+        page_num: int,
+        doc_name: str,
+        topic: str
+    ) -> List[Dict]:
+        """
+        Process a single PDF page for image extraction (thread-safe).
+
+        Args:
+            pdf_path: Path to PDF file
+            page_num: Page number (0-indexed)
+            doc_name: Document name for metadata
+            topic: Topic name
+
+        Returns:
+            List of extracted image info dicts from this page
+        """
+        extracted = []
+
+        try:
+            # Open PDF in this thread (PyMuPDF documents are not thread-safe)
+            pdf = fitz.open(pdf_path)
+            page = pdf[page_num]
+
+            # Step 1: Extract all text blocks with coordinates
+            text_blocks = self._extract_text_blocks_with_coords(page)
+
+            # Step 2: Detect figure captions from text blocks
+            captions = self._detect_figure_caption(text_blocks)
+
+            # Step 3: Get all images on this page
+            image_list = page.get_images(full=True)
+
+            for img_index, img_info in enumerate(image_list):
+                try:
+                    xref = img_info[0]
+
+                    # Extract the image
+                    base_image = pdf.extract_image(xref)
+                    if not base_image:
+                        continue
+
+                    image_bytes = base_image["image"]
+                    image_ext = base_image.get("ext", "png")
+                    width = base_image.get("width", 0)
+                    height = base_image.get("height", 0)
+
+                    # Filter: Skip tiny images (icons, bullets, decorations)
+                    if width < 150 or height < 150:
+                        continue
+
+                    # Filter: Skip very narrow/tall images (likely borders)
+                    aspect_ratio = width / height if height > 0 else 0
+                    if aspect_ratio > 5 or aspect_ratio < 0.2:
+                        continue
+
+                    # Filter: Skip very large images (likely backgrounds)
+                    if width > 2500 or height > 2500:
+                        continue
+
+                    # Filter: Skip very small file sizes (simple graphics)
+                    if len(image_bytes) < 5000:
+                        continue
+
+                    # Generate hash for deduplication
+                    image_hash = hashlib.md5(image_bytes).hexdigest()
+
+                    # Check if already exists (thread-safe)
+                    with self._db_lock:
+                        conn = sqlite3.connect(DB_PATH)
+                        cursor = conn.cursor()
+                        cursor.execute("SELECT id FROM images WHERE image_hash = ?", (image_hash,))
+                        exists = cursor.fetchone() is not None
+                        conn.close()
+
+                    if exists:
+                        continue
+
+                    # Step 4: Get image bounding box
+                    image_bbox = self._get_image_bbox_on_page(page, xref)
+
+                    # Step 5: Find layout-aware context
+                    if image_bbox:
+                        context_info = self._find_nearby_text_for_image(
+                            image_bbox, text_blocks, captions
+                        )
+                    else:
+                        # Fallback: use page-level caption detection
+                        context_info = {
+                            "figure_caption": captions[0]["text"] if captions else None,
+                            "context_text": " | ".join([c["text"] for c in captions[:2]]) if captions else "",
+                            "section_heading": None,
+                        }
+                        image_bbox = (0, 0, 0, 0)  # Unknown bbox
+
+                    # Save image
+                    image_filename = f"{Path(pdf_path).stem}_p{page_num + 1}_fig{img_index}.{image_ext}"
+                    image_path = self.images_dir / image_filename
+
+                    with open(image_path, "wb") as f:
+                        f.write(image_bytes)
+
+                    # Store metadata with layout-aware context and topic (thread-safe)
+                    image_id = self._store_image_metadata_threadsafe(
+                        image_hash=image_hash,
+                        image_path=str(image_path),
+                        document_name=doc_name,
+                        page_number=page_num + 1,
+                        context_text=context_info.get("context_text", ""),
+                        figure_caption=context_info.get("figure_caption"),
+                        bbox=image_bbox,
+                        topic=topic
+                    )
+
+                    if image_id:
+                        extracted.append({
+                            "id": image_id,
+                            "path": str(image_path),
+                            "page": page_num + 1,
+                            "caption": context_info.get("figure_caption"),
+                        })
+
+                except Exception:
+                    continue
+
+            pdf.close()
+
+        except Exception:
+            pass
+
+        return extracted
+
+    def _store_image_metadata_threadsafe(
+        self,
+        image_hash: str,
+        image_path: str,
+        document_name: str,
+        page_number: int,
+        context_text: str = "",
+        figure_caption: str = None,
+        bbox: Tuple[float, float, float, float] = None,
+        topic: str = None
+    ) -> Optional[int]:
+        """Thread-safe version of _store_image_metadata"""
+        with self._db_lock:
+            return self._store_image_metadata(
+                image_hash=image_hash,
+                image_path=image_path,
+                document_name=document_name,
+                page_number=page_number,
+                context_text=context_text,
+                figure_caption=figure_caption,
+                bbox=bbox,
+                topic=topic
+            )
+
     def extract_images_from_pdf(self, pdf_path: str, doc_name: str, topic: str = None) -> List[Dict]:
         """
         Extract figures/diagrams from PDF with layout-aware context extraction.
+        Uses parallel processing for faster extraction on multi-page PDFs.
 
         For each image:
         - Extract bounding box coordinates
@@ -349,123 +529,47 @@ class ImageExtractor:
         extracted_images = []
 
         try:
+            # Get page count first
             pdf = fitz.open(pdf_path)
             total_pages = len(pdf)
-            print(f"  [IMG] Extracting figures from {total_pages} pages (layout-aware)...")
-
-            image_count = 0
-
-            for page_num in range(total_pages):
-                try:
-                    page = pdf[page_num]
-
-                    # Step 1: Extract all text blocks with coordinates
-                    text_blocks = self._extract_text_blocks_with_coords(page)
-
-                    # Step 2: Detect figure captions from text blocks
-                    captions = self._detect_figure_caption(text_blocks)
-
-                    # Step 3: Get all images on this page
-                    image_list = page.get_images(full=True)
-
-                    for img_index, img_info in enumerate(image_list):
-                        try:
-                            xref = img_info[0]
-
-                            # Extract the image
-                            base_image = pdf.extract_image(xref)
-                            if not base_image:
-                                continue
-
-                            image_bytes = base_image["image"]
-                            image_ext = base_image.get("ext", "png")
-                            width = base_image.get("width", 0)
-                            height = base_image.get("height", 0)
-
-                            # Filter: Skip tiny images (icons, bullets, decorations)
-                            if width < 150 or height < 150:
-                                continue
-
-                            # Filter: Skip very narrow/tall images (likely borders)
-                            aspect_ratio = width / height if height > 0 else 0
-                            if aspect_ratio > 5 or aspect_ratio < 0.2:
-                                continue
-
-                            # Filter: Skip very large images (likely backgrounds)
-                            if width > 2500 or height > 2500:
-                                continue
-
-                            # Filter: Skip very small file sizes (simple graphics)
-                            if len(image_bytes) < 5000:
-                                continue
-
-                            # Generate hash for deduplication
-                            image_hash = hashlib.md5(image_bytes).hexdigest()
-
-                            # Check if already exists
-                            conn = sqlite3.connect(DB_PATH)
-                            cursor = conn.cursor()
-                            cursor.execute("SELECT id FROM images WHERE image_hash = ?", (image_hash,))
-                            if cursor.fetchone():
-                                conn.close()
-                                continue
-                            conn.close()
-
-                            # Step 4: Get image bounding box
-                            image_bbox = self._get_image_bbox_on_page(page, xref)
-
-                            # Step 5: Find layout-aware context
-                            if image_bbox:
-                                context_info = self._find_nearby_text_for_image(
-                                    image_bbox, text_blocks, captions
-                                )
-                            else:
-                                # Fallback: use page-level caption detection
-                                context_info = {
-                                    "figure_caption": captions[0]["text"] if captions else None,
-                                    "context_text": " | ".join([c["text"] for c in captions[:2]]) if captions else "",
-                                    "section_heading": None,
-                                }
-                                image_bbox = (0, 0, 0, 0)  # Unknown bbox
-
-                            # Save image
-                            image_filename = f"{Path(pdf_path).stem}_p{page_num + 1}_fig{img_index}.{image_ext}"
-                            image_path = self.images_dir / image_filename
-
-                            with open(image_path, "wb") as f:
-                                f.write(image_bytes)
-
-                            # Store metadata with layout-aware context and topic
-                            image_id = self._store_image_metadata(
-                                image_hash=image_hash,
-                                image_path=str(image_path),
-                                document_name=doc_name,
-                                page_number=page_num + 1,
-                                context_text=context_info.get("context_text", ""),
-                                figure_caption=context_info.get("figure_caption"),
-                                bbox=image_bbox,
-                                topic=topic
-                            )
-
-                            if image_id:
-                                extracted_images.append({
-                                    "id": image_id,
-                                    "path": str(image_path),
-                                    "page": page_num + 1,
-                                    "caption": context_info.get("figure_caption"),
-                                })
-                                image_count += 1
-
-                        except Exception as img_err:
-                            continue
-
-                except Exception as page_err:
-                    continue
-
-                if (page_num + 1) % 100 == 0:
-                    print(f"  [OK] Processed {page_num + 1}/{total_pages} pages, found {image_count} figures...")
-
             pdf.close()
+
+            print(f"  [IMG] Extracting figures from {total_pages} pages (parallel, {self.max_workers} workers)...")
+
+            # Use parallel processing for pages
+            num_workers = min(self.max_workers, total_pages)
+
+            with ThreadPoolExecutor(max_workers=num_workers) as executor:
+                # Submit all page processing tasks
+                future_to_page = {
+                    executor.submit(
+                        self._process_pdf_page,
+                        pdf_path,
+                        page_num,
+                        doc_name,
+                        topic
+                    ): page_num
+                    for page_num in range(total_pages)
+                }
+
+                # Collect results with progress bar
+                if self.show_progress and TQDM_AVAILABLE:
+                    futures = tqdm(
+                        as_completed(future_to_page),
+                        total=total_pages,
+                        desc="Processing pages",
+                        unit="page"
+                    )
+                else:
+                    futures = as_completed(future_to_page)
+
+                for future in futures:
+                    try:
+                        page_images = future.result()
+                        extracted_images.extend(page_images)
+                    except Exception:
+                        continue
+
             print(f"  [OK] Extracted {len(extracted_images)} figures/diagrams with layout context")
 
         except Exception as e:

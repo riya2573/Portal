@@ -945,16 +945,17 @@ def _is_image_only_request(query: str) -> bool:
 
 
 def _format_context(texts: List[str], metadatas: List[dict]) -> str:
-    """Format retrieved documents into context"""
+    """Format retrieved documents into context - clean format without citation markers"""
     context_parts = []
 
-    for text, metadata in zip(texts, metadatas):
-        doc_name = metadata.get("document_name", "Unknown")
-        chunk_idx = metadata.get("chunk_index", 0)
+    for i, (text, metadata) in enumerate(zip(texts, metadatas), 1):
+        # Clean format that doesn't encourage the LLM to add inline citations
+        # Remove page markers from text for cleaner context
+        clean_text = re.sub(r'\[Page\s*\d+\]\s*', '', text)
+        clean_text = re.sub(r'\[Slide\s*\d+\]\s*', '', clean_text)
+        context_parts.append(f"--- Document {i} ---\n{clean_text}")
 
-        context_parts.append(f"[From {doc_name} - Section {chunk_idx + 1}]:\n{text}")
-
-    return "\n\n---\n\n".join(context_parts)
+    return "\n\n".join(context_parts)
 
 
 def _enrich_sources_with_pages(texts: List[str], metadatas: List[dict]) -> List[dict]:
