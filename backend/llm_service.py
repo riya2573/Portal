@@ -74,6 +74,7 @@ class LLMService:
                 "prompt": prompt,
                 "stream": False,
                 "temperature": 0.7,
+                "num_predict": 2048,  # Allow longer responses (default is often 128)
             }
 
             response = requests.post(url, json=payload, timeout=OLLAMA_TIMEOUT)
@@ -110,6 +111,7 @@ class LLMService:
                 "prompt": prompt,
                 "stream": True,
                 "temperature": 0.7,
+                "num_predict": 2048,  # Allow longer responses
             }
 
             with requests.post(url, json=payload, stream=True, timeout=OLLAMA_TIMEOUT) as response:
