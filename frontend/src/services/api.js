@@ -67,6 +67,9 @@ export const sessionAPI = {
   },
 };
 
+// Store for active abort controllers
+let activeAbortController = null;
+
 // Chat services
 export const chatAPI = {
   // Send a message and get response (non-streaming)
@@ -80,9 +83,24 @@ export const chatAPI = {
     }
   },
 
-  // Send message with streaming response (supports topic filtering)
-  sendMessageStream: async (text, sessionId = null, topics = null, onToken, onSources, onImages, onDone, onError) => {
+  // Abort the current streaming request
+  abortStream: () => {
+    if (activeAbortController) {
+      console.log('[API] Aborting stream...');
+      activeAbortController.abort();
+      activeAbortController = null;
+      return true;
+    }
+    return false;
+  },
+
+  // Send message with streaming response (supports topic filtering and conversation history)
+  sendMessageStream: async (text, sessionId = null, topics = null, conversationHistory = null, onToken, onSources, onImages, onDone, onError) => {
     let doneReceived = false;
+
+    // Create new abort controller for this request
+    activeAbortController = new AbortController();
+    const signal = activeAbortController.signal;
 
     const processLine = (line) => {
       if (line.startsWith('data: ')) {
@@ -121,11 +139,16 @@ export const chatAPI = {
     };
 
     try {
-      // Build request body with optional topics filter
+      // Build request body with optional topics filter and conversation history
       const requestBody = { text, session_id: sessionId };
       if (topics && topics.length > 0) {
         requestBody.topics = topics;
         console.log('[API] Sending with topic filter:', topics);
+      }
+      if (conversationHistory && conversationHistory.length > 0) {
+        // Send last 4 messages (2 exchanges) for context
+        requestBody.conversation_history = conversationHistory.slice(-4);
+        console.log('[API] Sending with conversation history:', requestBody.conversation_history.length, 'messages');
       }
 
       const response = await fetch(`${API_BASE_URL}/chat/stream`, {
@@ -134,6 +157,7 @@ export const chatAPI = {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify(requestBody),
+        signal, // Add abort signal
       });
 
       if (!response.ok) {
@@ -172,6 +196,13 @@ export const chatAPI = {
         if (onDone) onDone(sessionId);
       }
     } catch (error) {
+      // Handle abort specifically
+      if (error.name === 'AbortError') {
+        console.log('[API] Stream aborted by user');
+        if (onDone) onDone(sessionId);
+        return; // Don't throw, just return
+      }
+
       console.error('Streaming error:', error);
       if (onError) onError(error.message);
       // Even on error, ensure we signal completion
@@ -179,6 +210,8 @@ export const chatAPI = {
         onDone(sessionId);
       }
       throw error;
+    } finally {
+      activeAbortController = null;
     }
   },
 

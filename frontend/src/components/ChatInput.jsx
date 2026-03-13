@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect, memo, useCallback } from 'react';
-import { Plus, Mic, MicOff, Send, Check, X, Filter } from 'lucide-react';
+import { Plus, Mic, MicOff, Send, Check, X, Filter, Square } from 'lucide-react';
 
 // Check if browser supports speech recognition
 const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -12,7 +12,8 @@ function ChatInput({
   availableTopics = [],
   selectedTopics = [],
   onToggleTopic,
-  onClearTopics
+  onClearTopics,
+  onStopGeneration
 }) {
   const [inputValue, setInputValue] = useState('');
   const [dropdownOpen, setDropdownOpen] = useState(false);
@@ -96,6 +97,23 @@ function ChatInput({
     }
     document.addEventListener('mousedown', handleClickOutside);
     return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, []);
+
+  // Listen for edit message events
+  useEffect(() => {
+    const handleEditMessage = (event) => {
+      const { text } = event.detail;
+      setInputValue(text);
+      // Focus the textarea
+      setTimeout(() => {
+        textareaRef.current?.focus();
+        // Move cursor to end
+        textareaRef.current?.setSelectionRange(text.length, text.length);
+      }, 100);
+    };
+
+    window.addEventListener('editMessage', handleEditMessage);
+    return () => window.removeEventListener('editMessage', handleEditMessage);
   }, []);
 
   const handleSubmit = useCallback((e) => {
@@ -355,24 +373,36 @@ function ChatInput({
           {isListening ? <MicOff size={20} /> : <Mic size={20} />}
         </button>
 
-        {/* Send Button */}
-        <button
-          type="submit"
-          disabled={!inputValue.trim() || loading || disabled}
-          className={`
-            p-2.5 rounded-xl transition-smooth
-            ${inputValue.trim() && !loading && !disabled
-              ? 'bg-gradient-to-r from-blue-500 to-blue-600 text-white shadow-[0_0_15px_rgba(59,130,246,0.4)] hover:from-blue-400 hover:to-blue-500 hover:shadow-[0_0_20px_rgba(59,130,246,0.5)] active:from-blue-600 active:to-blue-700'
-              : 'bg-gray-200 dark:bg-dark-hover text-gray-400 dark:text-gray-600 cursor-not-allowed'
-            }
-          `}
-        >
-          {loading ? (
-            <div className="w-5 h-5 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-          ) : (
+        {/* Send / Stop Button */}
+        {loading ? (
+          <button
+            type="button"
+            onClick={onStopGeneration}
+            className="p-2.5 rounded-xl transition-smooth
+              bg-gradient-to-r from-red-500 to-red-600 text-white
+              shadow-[0_0_15px_rgba(239,68,68,0.4)]
+              hover:from-red-400 hover:to-red-500
+              hover:shadow-[0_0_20px_rgba(239,68,68,0.5)]
+              active:from-red-600 active:to-red-700"
+            title="Stop generating"
+          >
+            <Square size={18} fill="currentColor" />
+          </button>
+        ) : (
+          <button
+            type="submit"
+            disabled={!inputValue.trim() || disabled}
+            className={`
+              p-2.5 rounded-xl transition-smooth
+              ${inputValue.trim() && !disabled
+                ? 'bg-gradient-to-r from-blue-500 to-blue-600 text-white shadow-[0_0_15px_rgba(59,130,246,0.4)] hover:from-blue-400 hover:to-blue-500 hover:shadow-[0_0_20px_rgba(59,130,246,0.5)] active:from-blue-600 active:to-blue-700'
+                : 'bg-gray-200 dark:bg-dark-hover text-gray-400 dark:text-gray-600 cursor-not-allowed'
+              }
+            `}
+          >
             <Send size={20} />
-          )}
-        </button>
+          </button>
+        )}
       </div>
 
       {/* Listening indicator */}

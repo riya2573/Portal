@@ -1,4 +1,4 @@
-import React, { useRef, useEffect, memo, useCallback } from 'react';
+import React, { useRef, useEffect, memo, useCallback, useState } from 'react';
 import { Menu, Sun, Moon, AlertCircle } from 'lucide-react';
 import MessageBubble from './MessageBubble';
 import ChatInput from './ChatInput';
@@ -12,17 +12,55 @@ function ChatArea({
   selectedTopics = [],
   onSendMessage,
   onRegenerate,
+  onEditMessage,
+  onStopGeneration,
   onToggleDarkMode,
   onToggleSidebar,
   onToggleTopic,
   onClearTopics
 }) {
   const messagesEndRef = useRef(null);
+  const messagesContainerRef = useRef(null);
+  const [userHasScrolledUp, setUserHasScrolledUp] = useState(false);
+  const lastMessageCountRef = useRef(0);
 
-  // Auto-scroll to bottom on new messages
+  // Detect if user has scrolled up (to disable auto-scroll)
+  const handleScroll = useCallback(() => {
+    const container = messagesContainerRef.current;
+    if (!container) return;
+
+    const { scrollTop, scrollHeight, clientHeight } = container;
+    const distanceFromBottom = scrollHeight - scrollTop - clientHeight;
+
+    // If user is more than 150px from bottom, they've scrolled up
+    setUserHasScrolledUp(distanceFromBottom > 150);
+  }, []);
+
+  // Auto-scroll to bottom only when:
+  // 1. A new message is added (not during streaming updates)
+  // 2. User hasn't scrolled up to read previous content
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages]);
+    const messageCount = messages.length;
+    const isNewMessage = messageCount > lastMessageCountRef.current;
+
+    // Only auto-scroll for new messages, not streaming updates
+    if (isNewMessage && !userHasScrolledUp) {
+      messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    }
+
+    lastMessageCountRef.current = messageCount;
+  }, [messages.length, userHasScrolledUp]);
+
+  // Reset scroll state when user sends a new message (loading becomes true)
+  useEffect(() => {
+    if (loading) {
+      setUserHasScrolledUp(false);
+      // Scroll to bottom when user sends a message
+      setTimeout(() => {
+        messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+      }, 100);
+    }
+  }, [loading]);
 
   return (
     <div className="flex-1 flex flex-col min-w-0">
@@ -74,16 +112,22 @@ function ChatArea({
       </header>
 
       {/* Messages Area */}
-      <div className="flex-1 overflow-y-auto scrollbar-thin">
+      <div
+        ref={messagesContainerRef}
+        onScroll={handleScroll}
+        className="flex-1 overflow-y-auto scrollbar-thin"
+      >
         {messages.length === 0 ? (
           <WelcomeScreen onSendMessage={onSendMessage} />
         ) : (
-          <div className="max-w-3xl mx-auto px-4 py-6 space-y-6">
-            {messages.map((message) => (
+          <div className="max-w-4xl mx-auto px-4 sm:px-6 py-6 space-y-6">
+            {messages.map((message, index) => (
               <MessageBubble
                 key={message.id}
                 message={message}
-                onRegenerate={message.type === 'assistant' ? onRegenerate : null}
+                onRegenerate={message.type === 'assistant' && !message.isStreaming ? onRegenerate : null}
+                onEdit={message.type === 'user' ? onEditMessage : null}
+                isGenerating={loading}
               />
             ))}
             <div ref={messagesEndRef} />
@@ -93,7 +137,7 @@ function ChatArea({
 
       {/* Input Area */}
       <div className="bg-white dark:bg-dark-surface/80 dark:backdrop-blur-sm">
-        <div className="max-w-3xl mx-auto px-4 py-4">
+        <div className="max-w-4xl mx-auto px-4 sm:px-6 py-4">
           <ChatInput
             onSendMessage={onSendMessage}
             loading={loading}
@@ -102,6 +146,7 @@ function ChatArea({
             selectedTopics={selectedTopics}
             onToggleTopic={onToggleTopic}
             onClearTopics={onClearTopics}
+            onStopGeneration={onStopGeneration}
           />
 
           {/* Disclaimer */}

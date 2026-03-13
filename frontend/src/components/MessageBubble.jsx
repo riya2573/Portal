@@ -1,6 +1,7 @@
 import React, { useState, memo, useCallback } from 'react';
 import ReactMarkdown from 'react-markdown';
-import { User, Copy, Check, RefreshCw, FileText } from 'lucide-react';
+import remarkGfm from 'remark-gfm';
+import { User, Copy, Check, RefreshCw, FileText, Pencil } from 'lucide-react';
 import ImageModal from './ImageModal';
 import { imageAPI, documentAPI } from '../services/api';
 
@@ -26,13 +27,17 @@ function getFileType(filename) {
   return 'DOC';
 }
 
-function MessageBubble({ message, onRegenerate }) {
+function MessageBubble({ message, onRegenerate, onEdit, isGenerating }) {
   const [copied, setCopied] = useState(false);
   const [selectedImage, setSelectedImage] = useState(null);
 
   const isUser = message.type === 'user';
   const isStreaming = message.isStreaming;
   const isError = message.isError;
+
+  const handleEdit = useCallback(() => {
+    if (onEdit) onEdit(message);
+  }, [onEdit, message]);
 
   const handleCopy = useCallback(async () => {
     await navigator.clipboard.writeText(message.text);
@@ -58,11 +63,28 @@ function MessageBubble({ message, onRegenerate }) {
       )}
 
       {/* Message Content */}
-      <div className={`flex flex-col max-w-[85%] ${isUser ? 'items-end' : 'items-start'}`}>
+      <div className={`flex flex-col ${isUser ? 'max-w-[85%] items-end' : 'max-w-[95%] items-start'}`}>
         {/* Message Bubble - User only, Assistant has no box */}
         {isUser ? (
-          <div className="rounded-2xl px-4 py-3 shadow-soft bg-gradient-to-br from-blue-500 via-blue-600 to-blue-700 text-white rounded-br-md shadow-[0_2px_15px_rgba(59,130,246,0.3)] dark:shadow-[0_4px_20px_rgba(59,130,246,0.4)]">
-            <p className="text-sm whitespace-pre-wrap">{message.text}</p>
+          <div className="group relative">
+            <div className="rounded-2xl px-4 py-3 shadow-soft bg-gradient-to-br from-blue-500 via-blue-600 to-blue-700 text-white rounded-br-md shadow-[0_2px_15px_rgba(59,130,246,0.3)] dark:shadow-[0_4px_20px_rgba(59,130,246,0.4)]">
+              <p className="text-sm whitespace-pre-wrap">{message.text}</p>
+            </div>
+            {/* Edit button for user messages - shows on hover */}
+            {onEdit && !isGenerating && (
+              <button
+                onClick={handleEdit}
+                className="absolute -left-10 top-1/2 -translate-y-1/2 p-1.5 rounded-lg
+                  text-charcoal-400 dark:text-gray-500
+                  opacity-0 group-hover:opacity-100
+                  hover:bg-gray-100 dark:hover:bg-dark-hover
+                  hover:text-blue-500 dark:hover:text-blue-400
+                  transition-all duration-200"
+                title="Edit message"
+              >
+                <Pencil size={14} />
+              </button>
+            )}
           </div>
         ) : (
           <div className={`${isError ? 'text-red-600 dark:text-red-400' : 'text-charcoal-800 dark:text-gray-100'}`}>
@@ -70,10 +92,10 @@ function MessageBubble({ message, onRegenerate }) {
               {isStreaming && !message.text ? (
                 <TypingIndicator />
               ) : (
-                <ReactMarkdown>{message.text}</ReactMarkdown>
+                <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.text}</ReactMarkdown>
               )}
               {isStreaming && message.text && (
-                <span className="inline-block w-2 h-4 bg-blue-500 animate-pulse ml-1" />
+                <span className="inline-block w-2 h-4 bg-blue-500 animate-pulse mt-1" />
               )}
             </div>
           </div>
@@ -114,37 +136,43 @@ function MessageBubble({ message, onRegenerate }) {
 
         {/* Images - only show after streaming is complete */}
         {!isUser && !isStreaming && message.images && message.images.length > 0 && (
-          <div className="flex flex-wrap gap-2 mt-3">
+          <div className={`flex flex-wrap gap-3 mt-3 ${!message.text ? 'message-images-only' : ''}`}>
             {message.images.map((image, idx) => (
               <button
                 key={idx}
                 onClick={() => handleImageClick(image)}
-                className="relative group overflow-hidden rounded-xl
+                className={`relative group overflow-hidden rounded-xl
                   border-2 border-gray-200 dark:border-dark-border/50
                   hover:border-blue-500 hover:shadow-[0_0_20px_rgba(59,130,246,0.3)]
                   dark:hover:shadow-[0_0_25px_rgba(59,130,246,0.4)]
                   dark:shadow-[0_4px_12px_rgba(0,0,0,0.3)]
-                  transition-all duration-300"
-                title={`${image.document_name} - Page ${image.page_number}`}
+                  transition-all duration-300
+                  ${!message.text ? 'transform hover:scale-105' : ''}`}
+                title={`${image.document_name} - Page ${image.page_number}${image.figure_caption ? ` - ${image.figure_caption}` : ''}`}
               >
                 <img
                   src={imageAPI.getImageUrl(image.image_id)}
                   alt={`Figure from ${image.document_name} page ${image.page_number}`}
-                  className="w-28 h-28 object-cover"
+                  className={`object-cover ${!message.text ? 'w-44 h-44 sm:w-52 sm:h-52' : 'w-28 h-28'}`}
                   loading="lazy"
                 />
                 <div className="absolute inset-0 bg-black/0 group-hover:bg-black/20 transition-all flex items-center justify-center">
-                  <span className="opacity-0 group-hover:opacity-100 text-white text-xs font-medium transition-opacity">
-                    View
+                  <span className="opacity-0 group-hover:opacity-100 text-white text-sm font-medium transition-opacity bg-black/50 px-3 py-1 rounded-full">
+                    Click to View
                   </span>
                 </div>
-                <div className="absolute bottom-0 left-0 right-0 px-1.5 py-1 bg-gradient-to-t from-black/80 to-transparent">
-                  <p className="text-white text-[10px] truncate font-medium">
-                    {getShortDocName(image.document_name, 15)}
+                <div className="absolute bottom-0 left-0 right-0 px-2 py-1.5 bg-gradient-to-t from-black/80 to-transparent">
+                  <p className="text-white text-[11px] truncate font-medium">
+                    {getShortDocName(image.document_name, !message.text ? 25 : 15)}
                   </p>
-                  <p className="text-white/80 text-[9px]">
+                  <p className="text-white/80 text-[10px]">
                     {getFileType(image.document_name)} • Page {image.page_number}
                   </p>
+                  {image.figure_caption && !message.text && (
+                    <p className="text-white/70 text-[9px] mt-0.5 truncate">
+                      {image.figure_caption}
+                    </p>
+                  )}
                 </div>
               </button>
             ))}

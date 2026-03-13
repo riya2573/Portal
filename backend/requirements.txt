@@ -1,0 +1,36 @@
+# FastAPI and server
+fastapi>=0.100.0
+uvicorn>=0.23.0
+python-multipart>=0.0.6
+
+# HTTP client
+requests>=2.31.0
+
+# Data processing
+numpy>=1.24.0
+pydantic>=2.0.0
+
+# Database
+qdrant-client>=1.6.0
+
+# Document processing
+python-docx>=0.8.11
+python-pptx>=0.6.21
+PyMuPDF>=1.23.0
+Pillow>=10.0.0
+
+# Embeddings (sentence-transformers)
+sentence-transformers>=2.2.0
+torch>=2.0.0
+transformers>=4.30.0
+huggingface_hub>=0.20.0
+einops>=0.7.0
+
+# LLM (llama-cpp-python - direct local execution)
+llama-cpp-python>=0.2.0
+
+# Progress bars
+tqdm>=4.65.0
+
+# SQLite ORM (for chat history)
+SQLAlchemy>=2.0.0

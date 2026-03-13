@@ -320,15 +320,20 @@
 }
 
 .markdown-content p {
-  @apply mb-3 last:mb-0;
+  @apply mb-4 last:mb-0;
+  line-height: 1.75;
 }
 
 .markdown-content ul, .markdown-content ol {
-  @apply ml-4 mb-3 space-y-1;
+  @apply ml-4 mb-4 space-y-2;
+  @apply pl-2;
 }
 
 .markdown-content li {
   @apply list-disc;
+  @apply block;
+  @apply leading-relaxed;
+  padding-left: 0.25rem;
 }
 
 .markdown-content ol li {
@@ -365,15 +370,215 @@
 
 .markdown-content strong {
   @apply font-semibold;
+  color: #1e40af;
+}
+
+.dark .markdown-content strong {
+  color: #60a5fa;
 }
 
 .markdown-content h1, .markdown-content h2, .markdown-content h3 {
-  @apply font-semibold mb-2 mt-4 first:mt-0;
+  @apply font-semibold mb-3 mt-5 first:mt-0;
+  color: #1e3a5f;
+}
+
+.dark .markdown-content h1,
+.dark .markdown-content h2,
+.dark .markdown-content h3 {
+  color: #93c5fd;
 }
 
 .markdown-content h1 { @apply text-xl; }
-.markdown-content h2 { @apply text-lg; }
+.markdown-content h2 {
+  @apply text-lg;
+  padding-bottom: 0.5rem;
+  border-bottom: 2px solid rgba(59, 130, 246, 0.2);
+  margin-bottom: 1rem;
+}
 .markdown-content h3 { @apply text-base; }
+
+/* Table styling for comparison questions */
+.markdown-content table {
+  @apply w-full mb-4 mt-3;
+  border-collapse: separate;
+  border-spacing: 0;
+  border-radius: 12px;
+  overflow: hidden;
+  box-shadow: 0 4px 15px rgba(0, 0, 0, 0.08);
+}
+
+.dark .markdown-content table {
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3), 0 0 0 1px rgba(59, 130, 246, 0.15);
+}
+
+.markdown-content thead {
+  background: linear-gradient(135deg, #3b82f6 0%, #2563eb 100%);
+}
+
+.dark .markdown-content thead {
+  background: linear-gradient(135deg, #1e40af 0%, #1d4ed8 100%);
+}
+
+.markdown-content th {
+  @apply px-4 py-3 text-left text-sm font-semibold text-white;
+  border-bottom: 2px solid rgba(255, 255, 255, 0.1);
+}
+
+.markdown-content th:first-child {
+  border-top-left-radius: 12px;
+}
+
+.markdown-content th:last-child {
+  border-top-right-radius: 12px;
+}
+
+.markdown-content td {
+  @apply px-4 py-3 text-sm;
+  border-bottom: 1px solid rgba(59, 130, 246, 0.1);
+  background: #ffffff;
+}
+
+.dark .markdown-content td {
+  background: rgba(26, 31, 46, 0.6);
+  border-bottom: 1px solid rgba(59, 130, 246, 0.1);
+  color: #e2e8f0;
+}
+
+.markdown-content tbody tr:nth-child(even) td {
+  background: #f8fafc;
+}
+
+.dark .markdown-content tbody tr:nth-child(even) td {
+  background: rgba(35, 42, 59, 0.5);
+}
+
+.markdown-content tbody tr:hover td {
+  background: rgba(59, 130, 246, 0.08);
+}
+
+.dark .markdown-content tbody tr:hover td {
+  background: rgba(59, 130, 246, 0.15);
+}
+
+.markdown-content tbody tr:last-child td:first-child {
+  border-bottom-left-radius: 12px;
+}
+
+.markdown-content tbody tr:last-child td:last-child {
+  border-bottom-right-radius: 12px;
+}
+
+/* Emoji styling in responses */
+.markdown-content p:has(✅),
+.markdown-content li:has(✅) {
+  color: #059669;
+}
+
+.dark .markdown-content p:has(✅),
+.dark .markdown-content li:has(✅) {
+  color: #34d399;
+}
+
+/* Blockquote styling for notes */
+.markdown-content blockquote {
+  @apply pl-4 py-2 my-4;
+  border-left: 4px solid #3b82f6;
+  background: rgba(59, 130, 246, 0.05);
+  border-radius: 0 8px 8px 0;
+}
+
+.dark .markdown-content blockquote {
+  background: rgba(59, 130, 246, 0.1);
+  border-left-color: #60a5fa;
+}
+
+/* Horizontal rule styling */
+.markdown-content hr {
+  @apply my-6;
+  border: none;
+  height: 2px;
+  background: linear-gradient(90deg, transparent, rgba(59, 130, 246, 0.3), transparent);
+}
+
+/* Table container for responsive scrolling */
+.markdown-content .table-container,
+.markdown-content > div:has(table) {
+  @apply overflow-x-auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+/* Ensure tables don't break the layout */
+.markdown-content table {
+  min-width: 400px;
+}
+
+/* Better spacing for advantages/disadvantages lists */
+.markdown-content ul li {
+  margin-bottom: 0.5rem;
+}
+
+/* Steps formatting */
+.markdown-content p strong:first-child {
+  display: inline-block;
+  margin-top: 0.75rem;
+}
+
+/* Better visual separation between sections */
+.markdown-content h2 + p,
+.markdown-content h3 + p {
+  margin-top: 0.5rem;
+}
+
+/* Image-only response styling (when no text) */
+.message-images-only {
+  @apply flex flex-wrap gap-3;
+}
+
+/* Larger image thumbnails for image-only responses */
+.message-images-only img {
+  @apply w-40 h-40 object-cover rounded-xl;
+}
+
+/* Comparison box styling for side-by-side comparisons */
+.comparison-box {
+  @apply p-4 rounded-xl mb-3;
+  background: linear-gradient(135deg, rgba(59, 130, 246, 0.05) 0%, rgba(59, 130, 246, 0.02) 100%);
+  border: 1px solid rgba(59, 130, 246, 0.15);
+}
+
+.dark .comparison-box {
+  background: linear-gradient(135deg, rgba(59, 130, 246, 0.1) 0%, rgba(59, 130, 246, 0.05) 100%);
+  border: 1px solid rgba(59, 130, 246, 0.2);
+}
+
+/* Animated highlight for key terms */
+@keyframes highlight-pulse {
+  0%, 100% { background-color: transparent; }
+  50% { background-color: rgba(59, 130, 246, 0.1); }
+}
+
+.markdown-content mark,
+.markdown-content .highlight {
+  background: linear-gradient(120deg, rgba(59, 130, 246, 0.2) 0%, rgba(59, 130, 246, 0.1) 100%);
+  padding: 0.1em 0.3em;
+  border-radius: 4px;
+}
+
+/* Ensure emojis render properly */
+.markdown-content {
+  font-family: 'Inter', system-ui, -apple-system, 'Segoe UI Emoji', 'Noto Color Emoji', sans-serif;
+}
+
+/* Better link styling */
+.markdown-content a {
+  @apply text-blue-600 hover:text-blue-700 underline decoration-blue-300 hover:decoration-blue-500;
+  text-underline-offset: 2px;
+  transition: all 0.2s ease;
+}
+
+.dark .markdown-content a {
+  @apply text-blue-400 hover:text-blue-300 decoration-blue-500 hover:decoration-blue-400;
+}
 
 /* Typing indicator */
 .typing-indicator {

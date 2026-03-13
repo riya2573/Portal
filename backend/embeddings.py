@@ -1,18 +1,14 @@
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 import numpy as np
 import hashlib
 import pickle
-import os
 from pathlib import Path
 from typing import List, Union, Optional, Dict
-from concurrent.futures import ThreadPoolExecutor, as_completed
+
 from config import (
-    EMBEDDINGS_MODEL,
-    OLLAMA_API_URL,
-    OLLAMA_TIMEOUT,
-    EMBEDDING_MAX_WORKERS,
+    EMBEDDING_MODEL_NAME,
+    EMBEDDING_DIMENSION,
+    EMBEDDING_BATCH_SIZE,
+    EMBEDDING_TRUST_REMOTE_CODE,
     ENABLE_EMBEDDING_CACHE,
     EMBEDDING_CACHE_DIR,
     SHOW_PROGRESS_BAR,
@@ -28,11 +24,11 @@ except ImportError:
 
 class EmbeddingsService:
     def __init__(self):
-        """Initialize the embeddings service using Ollama's nomic-embed-text"""
-        self.model = EMBEDDINGS_MODEL
-        self.api_url = OLLAMA_API_URL
-        self._embedding_dim = None
-        self.max_workers = EMBEDDING_MAX_WORKERS
+        """Initialize the embeddings service using sentence-transformers"""
+        self.model_name = EMBEDDING_MODEL_NAME
+        self._model = None  # Lazy-loaded
+        self._embedding_dim = EMBEDDING_DIMENSION
+        self.batch_size = EMBEDDING_BATCH_SIZE
         self.cache_enabled = ENABLE_EMBEDDING_CACHE
         self.cache_dir = EMBEDDING_CACHE_DIR if ENABLE_EMBEDDING_CACHE else None
         self.show_progress = SHOW_PROGRESS_BAR and TQDM_AVAILABLE
@@ -42,60 +38,38 @@ class EmbeddingsService:
         self._cache_misses = 0
         self._total_requests = 0
 
-        # Create connection pool with retry strategy
-        self._session = self._create_session()
-
-        self._verify_model()
-        print(f"[OK] Using Ollama embeddings model: {self.model}")
-        print(f"     Parallel workers: {self.max_workers}")
+        print(f"[OK] Embeddings service initialized")
+        print(f"     Model: {self.model_name}")
+        print(f"     Batch size: {self.batch_size}")
         print(f"     Embedding cache: {'enabled' if self.cache_enabled else 'disabled'}")
         print(f"     Progress bars: {'enabled' if self.show_progress else 'disabled'}")
 
-    def _create_session(self) -> requests.Session:
-        """Create a requests session with connection pooling and retry strategy"""
-        session = requests.Session()
-
-        # Configure retry strategy
-        retry_strategy = Retry(
-            total=3,
-            backoff_factor=0.5,
-            status_forcelist=[500, 502, 503, 504],
-        )
-
-        # Configure connection pool with adapter
-        adapter = HTTPAdapter(
-            pool_connections=self.max_workers,
-            pool_maxsize=self.max_workers * 2,
-            max_retries=retry_strategy,
-        )
-
-        session.mount("http://", adapter)
-        session.mount("https://", adapter)
-
-        return session
-
-    def _verify_model(self):
-        """Verify the embedding model is available in Ollama"""
-        try:
-            response = self._session.get(f"{self.api_url}/api/tags", timeout=10)
-            if response.status_code == 200:
-                models = response.json().get("models", [])
-                model_names = [m.get("name", "") for m in models]
-                # Check if model is available (with or without :latest tag)
-                model_found = any(
-                    self.model in name or name.startswith(self.model.split(":")[0])
-                    for name in model_names
+    def _load_model(self):
+        """Lazy-load the sentence-transformer model"""
+        if self._model is None:
+            print(f"[INFO] Loading embedding model: {self.model_name}...")
+            try:
+                from sentence_transformers import SentenceTransformer
+                self._model = SentenceTransformer(
+                    self.model_name,
+                    trust_remote_code=EMBEDDING_TRUST_REMOTE_CODE,
+                    device="cpu"  # Force CPU only
                 )
-                if not model_found:
-                    print(f"[WARN] Model '{self.model}' not found in Ollama.")
-                    print(f"  Available models: {model_names}")
-                    print(f"  Run: ollama pull {self.model}")
-        except Exception as e:
-            print(f"[WARN] Could not verify model availability: {e}")
+                # Verify dimension
+                test_embedding = self._model.encode(["test"], convert_to_numpy=True)
+                actual_dim = test_embedding.shape[1]
+                if actual_dim != self._embedding_dim:
+                    print(f"[WARN] Model dimension {actual_dim} differs from configured {self._embedding_dim}")
+                    self._embedding_dim = actual_dim
+                print(f"[OK] Embedding model loaded (dimension: {self._embedding_dim})")
+            except Exception as e:
+                print(f"[ERROR] Failed to load embedding model: {e}")
+                raise
+        return self._model
 
     def _get_cache_key(self, text: str) -> str:
         """Generate a cache key for a text using SHA256 hash"""
-        return hashlib.sha256(f"{self.model}:{text}".encode()).hexdigest()
+        return hashlib.sha256(f"{self.model_name}:{text}".encode()).hexdigest()
 
     def _get_cache_path(self, cache_key: str) -> Path:
         """Get the file path for a cached embedding"""
@@ -152,7 +126,7 @@ class EmbeddingsService:
         show_progress: Optional[bool] = None
     ) -> np.ndarray:
         """
-        Generate embeddings for text or list of texts using Ollama with parallel processing
+        Generate embeddings for text or list of texts using sentence-transformers
 
         Args:
             texts: String or list of strings to embed
@@ -188,109 +162,76 @@ class EmbeddingsService:
         if not texts_to_compute:
             return np.array(embeddings)
 
-        # Generate embeddings for uncached texts in parallel
-        computed_embeddings = self._generate_embeddings_parallel(
-            texts_to_compute, show_progress
+        # Load model (lazy loading)
+        model = self._load_model()
+
+        # Generate embeddings in batches
+        computed_embeddings = self._generate_embeddings_batch(
+            model, texts_to_compute, show_progress
         )
 
         # Merge results and cache new embeddings
         for idx, text, embedding in zip(indices_to_compute, texts_to_compute, computed_embeddings):
-            embeddings[idx] = embedding
-            self._save_to_cache(text, embedding)
+            embedding_list = embedding.tolist() if isinstance(embedding, np.ndarray) else embedding
+            embeddings[idx] = embedding_list
+            self._save_to_cache(text, embedding_list)
 
         return np.array(embeddings)
 
-    def _generate_embeddings_parallel(
+    def _generate_embeddings_batch(
         self,
+        model,
         texts: List[str],
         show_progress: bool = False
-    ) -> List[List[float]]:
+    ) -> List[np.ndarray]:
         """
-        Generate embeddings in parallel using ThreadPoolExecutor
+        Generate embeddings in batches using sentence-transformers
 
         Args:
+            model: SentenceTransformer model
             texts: List of texts to embed
             show_progress: Whether to show progress bar
 
         Returns:
-            List of embeddings
+            List of embeddings as numpy arrays
         """
-        if len(texts) == 1:
-            # Single text, no need for parallel processing
-            return [self._get_embedding(texts[0])]
+        all_embeddings = []
 
-        embeddings = [None] * len(texts)
+        # Process in batches
+        num_batches = (len(texts) + self.batch_size - 1) // self.batch_size
 
-        # Choose number of workers based on batch size
-        num_workers = min(self.max_workers, len(texts))
-
-        with ThreadPoolExecutor(max_workers=num_workers) as executor:
-            # Submit all tasks
-            future_to_index = {
-                executor.submit(self._get_embedding, text): i
-                for i, text in enumerate(texts)
-            }
-
-            # Progress tracking
-            if show_progress and TQDM_AVAILABLE:
-                futures = tqdm(
-                    as_completed(future_to_index),
-                    total=len(texts),
-                    desc="Generating embeddings",
-                    unit="text"
-                )
-            else:
-                futures = as_completed(future_to_index)
-
-            # Collect results
-            for future in futures:
-                idx = future_to_index[future]
-                try:
-                    embeddings[idx] = future.result()
-                except Exception as e:
-                    print(f"[ERROR] Failed to get embedding for text {idx}: {e}")
-                    dim = self._embedding_dim or 768
-                    embeddings[idx] = [0.0] * dim
-
-        return embeddings
-
-    def _get_embedding(self, text: str) -> List[float]:
-        """
-        Get embedding for a single text using Ollama API
-
-        Args:
-            text: Text to embed
-
-        Returns:
-            Embedding as list of floats
-        """
-        try:
-            response = self._session.post(
-                f"{self.api_url}/api/embeddings",
-                json={"model": self.model, "prompt": text},
-                timeout=OLLAMA_TIMEOUT,
+        if show_progress and TQDM_AVAILABLE:
+            batch_iterator = tqdm(
+                range(0, len(texts), self.batch_size),
+                total=num_batches,
+                desc="Generating embeddings",
+                unit="batch"
             )
-            response.raise_for_status()
-            result = response.json()
-            embedding = result.get("embedding", [])
+        else:
+            batch_iterator = range(0, len(texts), self.batch_size)
 
-            # Cache the dimension on first successful call
-            if self._embedding_dim is None and embedding:
-                self._embedding_dim = len(embedding)
+        for batch_start in batch_iterator:
+            batch_end = min(batch_start + self.batch_size, len(texts))
+            batch_texts = texts[batch_start:batch_end]
 
-            return embedding
-        except Exception as e:
-            print(f"[ERROR] Failed to get embedding: {e}")
-            # Return zero vector of expected dimension (768 for nomic-embed-text)
-            dim = self._embedding_dim or 768
-            return [0.0] * dim
+            try:
+                # Generate embeddings for batch
+                batch_embeddings = model.encode(
+                    batch_texts,
+                    convert_to_numpy=True,
+                    show_progress_bar=False  # We handle progress ourselves
+                )
+                all_embeddings.extend(batch_embeddings)
+            except Exception as e:
+                print(f"[ERROR] Failed to generate embeddings for batch: {e}")
+                # Return zero vectors for failed batch
+                for _ in batch_texts:
+                    all_embeddings.append(np.zeros(self._embedding_dim))
+
+        return all_embeddings
 
     def get_embedding_dimension(self) -> int:
         """Get the dimension of embeddings"""
-        if self._embedding_dim is None:
-            # Get a test embedding to determine dimension
-            test_embedding = self._get_embedding("test")
-            self._embedding_dim = len(test_embedding) if test_embedding else 768
         return self._embedding_dim
 
     def clear_cache(self):

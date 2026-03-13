@@ -11,8 +11,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from config import (
     IMAGES_DIR,
     DB_PATH,
-    OLLAMA_API_URL,
-    OLLAMA_TIMEOUT,
     DEFAULT_TOPIC,
     IMAGE_EXTRACTION_MAX_WORKERS,
     SHOW_PROGRESS_BAR,
@@ -857,12 +855,13 @@ class ImageExtractor:
                              search_terms: List[str] = None,
                              text_content: str = None,
                              max_images: int = 3,
-                             query: str = None) -> List[Dict]:
+                             query: str = None,
+                             topics: List[str] = None) -> List[Dict]:
         """
         Find relevant images using layout-derived context (NO LLaVA).
 
         Retrieval priority:
-        1. Figure captions matching the query
+        1. Figure captions matching the query (with multiple word bonus)
         2. Layout-derived context text
         3. Page-based matching (as approximate hint only)
 
@@ -875,6 +874,7 @@ class ImageExtractor:
             text_content: Text content for figure reference detection
             max_images: Maximum images to return
             query: Original user query
+            topics: Topic filters (from folder names)
 
         Returns:
             List of relevant images (empty if no good match)
@@ -882,15 +882,36 @@ class ImageExtractor:
         found_images = []
         seen_ids = set()
 
-        # Minimum relevance threshold - if no image scores above this, return nothing
-        MIN_RELEVANCE_SCORE = 5
+        # Calculate dynamic minimum score based on query
+        # More specific queries (more words) need higher scores
+        query_words = set(re.findall(r'\b[a-zA-Z]{3,}\b', (query or "").lower()))
+        stop_words = {'what', 'is', 'the', 'a', 'an', 'how', 'does', 'show', 'me',
+                      'explain', 'about', 'and', 'or', 'of', 'in', 'to', 'for', 'this',
+                      'that', 'give', 'image', 'images', 'picture', 'pictures', 'diagram',
+                      'diagrams', 'figure', 'figures', 'display'}
+        meaningful_words = query_words - stop_words
+
+        # Minimum score = require at least 2 meaningful words to match, or 1 word must be in CAPTION
+        # Single common word like "piping" needs caption match, not just context
+        num_meaningful = len(meaningful_words)
+
+        # Higher threshold for generic single-word queries
+        if num_meaningful <= 1:
+            MIN_RELEVANCE_SCORE = 15  # Requires caption match (word_len * 2 + bonuses)
+        elif num_meaningful == 2:
+            MIN_RELEVANCE_SCORE = 12  # Need good multi-word match
+        else:
+            MIN_RELEVANCE_SCORE = 10  # Multi-word queries are more specific
+
+        print(f"  [IMG] Query has {num_meaningful} meaningful words, min_score={MIN_RELEVANCE_SCORE}")
 
         # STRATEGY 1: Search by figure caption (HIGHEST PRIORITY)
         if query or search_terms:
             caption_matches = self._search_by_figure_caption(
                 query or " ".join(search_terms or []),
                 document_name,
-                max_images * 2
+                max_images * 2,
+                topics=topics
             )
 
             for img in caption_matches:
@@ -898,14 +919,17 @@ class ImageExtractor:
                     if img.get("score", 0) >= MIN_RELEVANCE_SCORE:
                         seen_ids.add(img["id"])
                         found_images.append(img)
-                        print(f"  [IMG] Found by caption match: '{img.get('figure_caption', '')[:50]}...'")
+                        print(f"  [IMG] Found by caption (score={img['score']}): '{img.get('figure_caption', '')[:50]}...'")
+                    else:
+                        print(f"  [IMG] Rejected (score={img['score']} < {MIN_RELEVANCE_SCORE}): '{img.get('figure_caption', '')[:40]}...'")
 
         # STRATEGY 2: Search by layout-derived context
         if len(found_images) < max_images and (query or search_terms):
             context_matches = self._search_by_context(
                 query or " ".join(search_terms or []),
                 document_name,
-                max_images * 2
+                max_images * 2,
+                topics=topics
             )
 
             for img in context_matches:
@@ -913,7 +937,9 @@ class ImageExtractor:
                     if img.get("score", 0) >= MIN_RELEVANCE_SCORE:
                         seen_ids.add(img["id"])
                         found_images.append(img)
-                        print(f"  [IMG] Found by context match: page {img['page_number']}")
+                        print(f"  [IMG] Found by context (score={img['score']}): page {img['page_number']}")
+                    else:
+                        print(f"  [IMG] Rejected context (score={img['score']} < {MIN_RELEVANCE_SCORE})")
 
         # STRATEGY 3: Figure reference in text (e.g., "see Figure 3-1")
         if text_content and len(found_images) < max_images:
@@ -938,14 +964,17 @@ class ImageExtractor:
 
         return found_images[:max_images]
 
-    def _search_by_figure_caption(self, query: str, document_name: str = None, limit: int = 5) -> List[Dict]:
+    def _search_by_figure_caption(self, query: str, document_name: str = None,
+                                     limit: int = 5, topics: List[str] = None) -> List[Dict]:
         """
         Search images by matching query against figure captions.
+        Uses smarter scoring with multi-word bonuses.
 
         Args:
             query: Search query
             document_name: Optional document filter
             limit: Max results
+            topics: Optional topic filter
 
         Returns:
             List of images with relevance scores
@@ -953,18 +982,25 @@ class ImageExtractor:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
 
+        # Build query with optional filters
+        conditions = ["figure_caption IS NOT NULL AND figure_caption != ''"]
+        params = []
+
         if document_name:
-            cursor.execute("""
-                SELECT id, image_path, document_name, page_number, figure_caption, context_text
-                FROM images
-                WHERE document_name = ? AND figure_caption IS NOT NULL AND figure_caption != ''
-            """, (document_name,))
-        else:
-            cursor.execute("""
-                SELECT id, image_path, document_name, page_number, figure_caption, context_text
-                FROM images
-                WHERE figure_caption IS NOT NULL AND figure_caption != ''
-            """)
+            conditions.append("document_name = ?")
+            params.append(document_name)
+
+        if topics:
+            placeholders = ",".join("?" * len(topics))
+            conditions.append(f"topic IN ({placeholders})")
+            params.extend(topics)
+
+        where_clause = " AND ".join(conditions)
+        cursor.execute(f"""
+            SELECT id, image_path, document_name, page_number, figure_caption, context_text, topic
+            FROM images
+            WHERE {where_clause}
+        """, params)
 
         rows = cursor.fetchall()
         conn.close()
@@ -976,21 +1012,42 @@ class ImageExtractor:
 
         # Remove common stop words
         stop_words = {'what', 'is', 'the', 'a', 'an', 'how', 'does', 'show', 'me',
-                      'explain', 'about', 'and', 'or', 'of', 'in', 'to', 'for', 'this', 'that'}
+                      'explain', 'about', 'and', 'or', 'of', 'in', 'to', 'for', 'this',
+                      'that', 'give', 'image', 'images', 'picture', 'pictures', 'diagram',
+                      'diagrams', 'figure', 'figures', 'display'}
         query_words = query_words - stop_words
 
         for row in rows:
-            img_id, img_path, doc_name, page_num, caption, context = row
+            img_id, img_path, doc_name, page_num, caption, context, topic = row
             caption_lower = (caption or "").lower()
 
-            # Calculate match score
+            # Calculate match score with bonuses
             score = 0
             matched_words = []
 
             for word in query_words:
                 if word in caption_lower:
-                    score += len(word) * 2  # Double weight for caption matches
+                    score += len(word) * 2  # Base score for caption match
                     matched_words.append(word)
+
+            # BONUS: Multiple word matches (specificity bonus)
+            if len(matched_words) >= 2:
+                score += len(matched_words) * 5  # +5 per additional matching word
+            if len(matched_words) >= 3:
+                score += 10  # Extra bonus for 3+ matches
+
+            # BONUS: Exact phrase match (e.g., "ball valve" appears as phrase)
+            for word in query_words:
+                # Check if query words appear adjacent in caption
+                if len(matched_words) >= 2:
+                    phrase = " ".join(sorted(matched_words)[:2])
+                    if phrase in caption_lower or " ".join(reversed(sorted(matched_words)[:2])) in caption_lower:
+                        score += 8
+
+            # PENALTY: Only matched very common/generic words
+            generic_words = {'pipe', 'piping', 'valve', 'pump', 'flow', 'system', 'process', 'unit'}
+            if matched_words and all(w in generic_words for w in matched_words) and len(matched_words) == 1:
+                score = score // 2  # Halve score for single generic word match
 
             if score > 0:
                 scored_images.append({
@@ -1001,6 +1058,7 @@ class ImageExtractor:
                     "figure_caption": caption,
                     "score": score,
                     "matched_words": matched_words,
+                    "match_type": "caption",
                 })
 
         # Sort by score descending
@@ -1008,14 +1066,17 @@ class ImageExtractor:
 
         return scored_images[:limit]
 
-    def _search_by_context(self, query: str, document_name: str = None, limit: int = 5) -> List[Dict]:
+    def _search_by_context(self, query: str, document_name: str = None,
+                            limit: int = 5, topics: List[str] = None) -> List[Dict]:
         """
         Search images by matching query against layout-derived context.
+        Context matches score lower than caption matches.
 
         Args:
             query: Search query
             document_name: Optional document filter
             limit: Max results
+            topics: Optional topic filter
 
         Returns:
             List of images with relevance scores
@@ -1023,18 +1084,25 @@ class ImageExtractor:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
 
+        # Build query with optional filters
+        conditions = ["context_text IS NOT NULL AND context_text != ''"]
+        params = []
+
         if document_name:
-            cursor.execute("""
-                SELECT id, image_path, document_name, page_number, figure_caption, context_text
-                FROM images
-                WHERE document_name = ? AND context_text IS NOT NULL AND context_text != ''
-            """, (document_name,))
-        else:
-            cursor.execute("""
-                SELECT id, image_path, document_name, page_number, figure_caption, context_text
-                FROM images
-                WHERE context_text IS NOT NULL AND context_text != ''
-            """)
+            conditions.append("document_name = ?")
+            params.append(document_name)
+
+        if topics:
+            placeholders = ",".join("?" * len(topics))
+            conditions.append(f"topic IN ({placeholders})")
+            params.extend(topics)
+
+        where_clause = " AND ".join(conditions)
+        cursor.execute(f"""
+            SELECT id, image_path, document_name, page_number, figure_caption, context_text, topic
+            FROM images
+            WHERE {where_clause}
+        """, params)
 
         rows = cursor.fetchall()
         conn.close()
@@ -1045,17 +1113,33 @@ class ImageExtractor:
         query_words = set(re.findall(r'\b[a-zA-Z]{3,}\b', query_lower))
 
         stop_words = {'what', 'is', 'the', 'a', 'an', 'how', 'does', 'show', 'me',
-                      'explain', 'about', 'and', 'or', 'of', 'in', 'to', 'for', 'this', 'that'}
+                      'explain', 'about', 'and', 'or', 'of', 'in', 'to', 'for', 'this',
+                      'that', 'give', 'image', 'images', 'picture', 'pictures', 'diagram',
+                      'diagrams', 'figure', 'figures', 'display'}
         query_words = query_words - stop_words
 
         for row in rows:
-            img_id, img_path, doc_name, page_num, caption, context = row
+            img_id, img_path, doc_name, page_num, caption, context, topic = row
             context_lower = (context or "").lower()
 
             score = 0
+            matched_words = []
+
             for word in query_words:
                 if word in context_lower:
-                    score += len(word)
+                    score += len(word)  # Base score (lower than caption)
+                    matched_words.append(word)
+
+            # BONUS: Multiple word matches
+            if len(matched_words) >= 2:
+                score += len(matched_words) * 3
+            if len(matched_words) >= 3:
+                score += 5
+
+            # PENALTY: Single generic word match in context only (very weak signal)
+            generic_words = {'pipe', 'piping', 'valve', 'pump', 'flow', 'system', 'process', 'unit'}
+            if len(matched_words) == 1 and matched_words[0] in generic_words:
+                score = score // 3  # Heavily penalize single generic word context match
 
             if score > 0:
                 scored_images.append({
@@ -1066,6 +1150,8 @@ class ImageExtractor:
                     "figure_caption": caption,
                     "context_text": context,
                     "score": score,
+                    "matched_words": matched_words,
+                    "match_type": "context",
                 })
 
         scored_images.sort(key=lambda x: x["score"], reverse=True)

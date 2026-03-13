@@ -222,10 +222,17 @@ function App() {
       // Pass selected topics to filter the search
       const topicsFilter = selectedTopics.length > 0 ? selectedTopics : null;
 
+      // Build conversation history for context (last 4 messages = 2 user-assistant pairs)
+      const conversationHistory = messages.slice(-4).map(msg => ({
+        role: msg.type === 'user' ? 'user' : 'assistant',
+        content: msg.text
+      }));
+
       await chatAPI.sendMessageStream(
         text,
         sessionId,
         topicsFilter,
+        conversationHistory,
         // onToken
         (token) => {
           setMessages(prev =>
@@ -348,10 +355,17 @@ function App() {
     try {
       const topicsFilter = selectedTopics.length > 0 ? selectedTopics : null;
 
+      // Build conversation history (excluding the last assistant message we're regenerating)
+      const conversationHistory = messages.slice(-5, -1).map(msg => ({
+        role: msg.type === 'user' ? 'user' : 'assistant',
+        content: msg.text
+      }));
+
       await chatAPI.sendMessageStream(
         lastUserMsg.text,
         currentSessionId,
         topicsFilter,
+        conversationHistory,
         (token) => {
           setMessages(prev =>
             prev.map(msg =>
@@ -425,6 +439,37 @@ function App() {
   // Memoize callbacks to prevent unnecessary re-renders
   const handleCloseSidebar = useCallback(() => setSidebarOpen(false), []);
 
+  // Handle stopping generation
+  const handleStopGeneration = useCallback(() => {
+    const aborted = chatAPI.abortStream();
+    if (aborted) {
+      // Mark the streaming message as complete with what we have
+      setMessages(prev =>
+        prev.map(msg =>
+          msg.isStreaming
+            ? { ...msg, isStreaming: false, text: msg.text + '\n\n*[Generation stopped]*' }
+            : msg
+        )
+      );
+      setLoading(false);
+      streamingMessageRef.current = null;
+    }
+  }, []);
+
+  // Handle editing a user message
+  const handleEditMessage = useCallback((message) => {
+    // Find the index of this message
+    const messageIndex = messages.findIndex(m => m.id === message.id);
+    if (messageIndex === -1) return;
+
+    // Remove this message and all messages after it
+    setMessages(prev => prev.slice(0, messageIndex));
+
+    // The text will be pre-filled by the ChatArea component
+    // We dispatch a custom event with the message text
+    window.dispatchEvent(new CustomEvent('editMessage', { detail: { text: message.text } }));
+  }, [messages]);
+
   // Handle topic selection (multi-select support)
   const handleToggleTopic = useCallback((topic) => {
     setSelectedTopics(prev => {
@@ -473,6 +518,8 @@ function App() {
         selectedTopics={selectedTopics}
         onSendMessage={handleSendMessage}
         onRegenerate={handleRegenerateResponse}
+        onEditMessage={handleEditMessage}
+        onStopGeneration={handleStopGeneration}
         onToggleDarkMode={toggleDarkMode}
         onToggleSidebar={toggleSidebar}
         onToggleTopic={handleToggleTopic}

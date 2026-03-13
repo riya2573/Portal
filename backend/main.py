@@ -36,10 +36,15 @@ app.add_middleware(
 
 
 # Pydantic models
+class ConversationMessage(BaseModel):
+    role: str  # "user" or "assistant"
+    content: str
+
 class Message(BaseModel):
     text: str
     session_id: Optional[str] = None
     topics: Optional[List[str]] = None  # Topic filters (multi-select)
+    conversation_history: Optional[List[ConversationMessage]] = None  # Recent conversation for context
 
 
 class ChatResponse(BaseModel):
@@ -64,7 +69,7 @@ class SessionResponse(BaseModel):
 
 class HealthResponse(BaseModel):
     status: str
-    ollama: bool
+    llm_server: bool
     documents_indexed: int
     images_indexed: int
 
@@ -148,12 +153,12 @@ async def health_check():
 
     stats = vector_store.get_collection_stats()
 
-    # Check Ollama connection
-    ollama_running = llm_service._verify_connection()
+    # Check llama.cpp server connection
+    llm_server_running = llm_service._verify_connection()
 
     return HealthResponse(
         status="healthy",
-        ollama=ollama_running,
+        llm_server=llm_server_running,
         documents_indexed=stats["text_documents"],
         images_indexed=stats["images"],
     )
@@ -356,10 +361,12 @@ async def chat(message: Message):
     - For image-only requests: Returns only images, no text answer
     - For questions: Returns text answer with relevant images
     - Supports topic filtering via message.topics
+    - Supports conversation context for follow-up questions
     """
     user_query = message.text.strip()
     session_id = message.session_id
     topics = message.topics  # Topic filters (can be None or list)
+    conversation_history = message.conversation_history  # Previous messages for context
 
     if not user_query:
         raise HTTPException(status_code=400, detail="Empty message")
@@ -373,6 +380,13 @@ async def chat(message: Message):
         response_images = []
         response_sources = []
         answer = ""
+
+        # Check if this is a follow-up question and resolve context
+        original_query = user_query
+        if conversation_history and _is_follow_up_question(user_query):
+            # Convert to list of dicts if needed
+            history_dicts = [{"role": msg.role, "content": msg.content} for msg in conversation_history]
+            user_query = _resolve_follow_up_query(user_query, history_dicts)
 
         # Log topic filter if used
         if topics:
@@ -407,7 +421,7 @@ async def chat(message: Message):
                 combined_text = ' '.join(text_chunks[:5])
 
                 relevant_images = image_extractor.find_relevant_images(
-                    doc_name, page_numbers, search_terms, text_content=combined_text, max_images=3, query=user_query
+                    doc_name, page_numbers, search_terms, text_content=combined_text, max_images=3, query=user_query, topics=topics
                 )
                 if relevant_images:
                     response_images = [{
@@ -440,6 +454,10 @@ async def chat(message: Message):
                 # Generate answer
                 answer = llm_service.generate_answer(context, user_query)
 
+                # If LLM says no information found, clear sources (they're misleading)
+                if "don't have information" in answer.lower() or "no information" in answer.lower():
+                    response_sources = []
+
                 # Step 2: Find relevant images - try to find up to 3
                 if text_metadata:
                     doc_name = text_metadata[0].get('document_name', '')
@@ -461,7 +479,7 @@ async def chat(message: Message):
                     combined_text = ' '.join(text_chunks[:5])
 
                     relevant_images = image_extractor.find_relevant_images(
-                        doc_name, page_numbers, search_terms, text_content=combined_text, max_images=3, query=user_query
+                        doc_name, page_numbers, search_terms, text_content=combined_text, max_images=3, query=user_query, topics=topics
                     )
                     if relevant_images:
                         response_images = [{
@@ -470,7 +488,7 @@ async def chat(message: Message):
                             "page_number": img["page_number"]
                         } for img in relevant_images]
             else:
-                answer = "I couldn't find any relevant information in the documents to answer your question."
+                answer = "I don't have information about this topic in my documents. Please ask questions related to the indexed documents."
 
         # Step 3: Save to chat history
         _save_chat_history(user_query, answer, response_sources, response_images, session_id)
@@ -498,13 +516,22 @@ async def chat_stream(message: Message):
     - For image-only requests: Returns only images, no text streaming
     - For questions: Streams text answer with relevant images
     - Supports topic filtering via message.topics
+    - Supports conversation context for follow-up questions
     """
     user_query = message.text.strip()
     session_id = message.session_id
     topics = message.topics  # Topic filters (can be None or list)
+    conversation_history = message.conversation_history  # Previous messages for context
 
     if not user_query:
         raise HTTPException(status_code=400, detail="Empty message")
+
+    # Check if this is a follow-up question and resolve context
+    original_query = user_query
+    if conversation_history and _is_follow_up_question(user_query):
+        # Convert to list of dicts if needed
+        history_dicts = [{"role": msg.role, "content": msg.content} for msg in conversation_history]
+        user_query = _resolve_follow_up_query(user_query, history_dicts)
 
     # Detect intent outside the generator so it's available
     is_image_request = _is_image_only_request(user_query)
@@ -549,7 +576,7 @@ async def chat_stream(message: Message):
                     combined_text = ' '.join(text_chunks[:5])
 
                     relevant_images = image_extractor.find_relevant_images(
-                        doc_name, page_numbers, search_terms, text_content=combined_text, max_images=3, query=user_query
+                        doc_name, page_numbers, search_terms, text_content=combined_text, max_images=3, query=user_query, topics=topics
                     )
                     if relevant_images:
                         response_images = [{
@@ -610,7 +637,7 @@ async def chat_stream(message: Message):
                             combined_text = ' '.join(text_chunks[:5])
 
                             relevant_images = image_extractor.find_relevant_images(
-                                doc_name, page_numbers, search_terms, text_content=combined_text, max_images=3, query=user_query
+                                doc_name, page_numbers, search_terms, text_content=combined_text, max_images=3, query=user_query, topics=topics
                             )
                             if relevant_images:
                                 response_images = [{
@@ -621,11 +648,16 @@ async def chat_stream(message: Message):
                         except Exception as img_error:
                             print(f"[WARN] Error finding images: {img_error}")
                 else:
-                    full_answer = "I couldn't find any relevant information in the documents to answer your question."
+                    full_answer = "I don't have information about this topic in my documents. Please ask questions related to the indexed documents."
                     yield f"data: {json.dumps({'type': 'token', 'token': full_answer})}\n\n"
 
-                # Send images at the end for question mode
-                if response_images:
+                # If answer indicates no information, clear sources (they're misleading)
+                if "don't have information" in full_answer.lower() or "no information" in full_answer.lower():
+                    response_sources = []
+                    yield f"data: {json.dumps({'type': 'sources', 'sources': []})}\n\n"
+
+                # Send images at the end for question mode (only if we have relevant info)
+                if response_images and response_sources:  # Only show images if we had relevant sources
                     yield f"data: {json.dumps({'type': 'images', 'images': response_images})}\n\n"
 
         except Exception as e:
@@ -895,6 +927,10 @@ def _is_image_only_request(query: str) -> bool:
     - "image of ball valve"
     - "picture of the assembly"
     - "diagram for gate valve"
+    - "give me images of X"
+    - "images of X"
+    - "show images"
+    - "give images"
 
     Returns False for questions like:
     - "what is a ball valve?"
@@ -902,6 +938,22 @@ def _is_image_only_request(query: str) -> bool:
     - "explain the valve operation"
     """
     query_lower = query.lower().strip()
+
+    # Direct image-only patterns (very explicit requests)
+    direct_image_patterns = [
+        r'^(give|show|display|get|find|fetch)\s*(me\s*)?(the\s*)?(only\s*)?(images?|pictures?|diagrams?|figures?|photos?|illustrations?)',
+        r'^(images?|pictures?|diagrams?|figures?)\s*(of|for|about)?\s*',
+        r'^(only\s+)?(images?|pictures?|diagrams?)',
+        r'(give|show|display)\s*(me\s*)?(only\s*)?(the\s*)?(images?|pictures?|diagrams?)',
+        r'^(images?|pictures?)\s*$',  # Just "images" or "image"
+    ]
+
+    # Check direct patterns first
+    for pattern in direct_image_patterns:
+        if re.search(pattern, query_lower):
+            # Make sure it's not a question about what images are
+            if not any(q in query_lower for q in ['what is', 'what are', 'how to', 'why', 'explain', 'describe', 'tell me about', 'definition']):
+                return True
 
     # Patterns that indicate image-only request
     image_request_patterns = [
@@ -917,45 +969,169 @@ def _is_image_only_request(query: str) -> bool:
     ]
 
     # Keywords that strongly indicate image request (at start or as main intent)
-    image_keywords_start = ['show', 'display', 'image', 'picture', 'diagram', 'figure', 'illustration', 'photo']
+    image_keywords_start = ['show', 'display', 'image', 'images', 'picture', 'pictures', 'diagram', 'diagrams', 'figure', 'figures', 'illustration', 'photo', 'photos']
 
     # Check if query starts with image-related word
     first_word = query_lower.split()[0] if query_lower.split() else ""
     if first_word in image_keywords_start:
         # But check it's not a question about images
-        if not any(q in query_lower for q in ['what is', 'how to', 'why', 'explain', 'describe', 'tell me about']):
+        if not any(q in query_lower for q in ['what is', 'what are', 'how to', 'why', 'explain', 'describe', 'tell me about']):
             return True
 
     # Check patterns
     for pattern in image_request_patterns:
         if re.search(pattern, query_lower):
             # Make sure it's not also asking a question
-            if not any(q in query_lower for q in ['?', 'what is', 'how does', 'why', 'explain', 'describe']):
+            if not any(q in query_lower for q in ['?', 'what is', 'what are', 'how does', 'why', 'explain', 'describe']):
                 return True
 
     # Check for "X diagram" or "X image" pattern (e.g., "valve diagram", "pump image")
-    if re.search(r'\b(diagram|image|picture|figure|illustration)\s*$', query_lower):
+    if re.search(r'\b(diagram|image|picture|figure|illustration)s?\s*$', query_lower):
         return True
 
     # Check for "diagram of X" or "image of X" anywhere
-    if re.search(r'\b(diagram|image|picture|figure|illustration)\s+(of|for)\s+', query_lower):
+    if re.search(r'\b(diagram|image|picture|figure|illustration)s?\s+(of|for)\s+', query_lower):
+        return True
+
+    # Check for "give me images to this" type follow-up
+    if re.search(r'(give|show|get)\s*(me\s*)?(images?|pictures?|diagrams?)\s*(to|for|of)?\s*(this|that|it)?', query_lower):
         return True
 
     return False
 
 
+def _is_follow_up_question(query: str) -> bool:
+    """
+    Detect if the query is a follow-up question that needs context from previous messages.
+
+    Returns True for queries like:
+    - "give me its overview"
+    - "what are its advantages"
+    - "tell me more about it"
+    - "explain this"
+    - "show me images of it"
+    """
+    query_lower = query.lower().strip()
+
+    # Pronouns that indicate follow-up (referring to something mentioned before)
+    follow_up_pronouns = ['it', 'its', 'this', 'that', 'these', 'those', 'them', 'their']
+
+    # Check if query contains follow-up pronouns without a clear subject
+    words = query_lower.split()
+
+    # Patterns that indicate follow-up questions
+    follow_up_patterns = [
+        r'\b(its|their)\s+(overview|advantages?|disadvantages?|benefits?|drawbacks?|features?|types?|applications?|uses?|steps?|procedure|process)',
+        r'\b(tell|give|show|explain)\s+(me\s+)?(more\s+)?(about\s+)?(it|this|that)\b',
+        r'^(what|how)\s+(is|are|about)\s+(it|this|that)\b',
+        r'\b(of|for|about)\s+(it|this|that|these|those)\s*$',
+        r'^(and|also|now)\s+',
+        r'^(its|this|that)\s+',
+        r'\b(the\s+same|above|previous|mentioned)\b',
+        r'^(more|further)\s+(details?|info|information|explanation)',
+        r'^(expand|elaborate)\s+(on)?\s*(it|this|that)?',
+    ]
+
+    for pattern in follow_up_patterns:
+        if re.search(pattern, query_lower):
+            return True
+
+    # Check if query is very short and contains pronouns (likely follow-up)
+    if len(words) <= 5:
+        for pronoun in follow_up_pronouns:
+            if pronoun in words:
+                return True
+
+    return False
+
+
+def _resolve_follow_up_query(query: str, conversation_history: List[dict]) -> str:
+    """
+    Resolve a follow-up query by extracting the subject from conversation history.
+
+    Args:
+        query: The follow-up query (e.g., "give me its overview")
+        conversation_history: List of previous messages [{"role": "user"/"assistant", "content": "..."}]
+
+    Returns:
+        Resolved query with the subject made explicit (e.g., "give me butterfly valve overview")
+    """
+    if not conversation_history:
+        return query
+
+    # Find the most recent user message that has a clear subject
+    recent_subject = None
+
+    for msg in reversed(conversation_history):
+        if msg.get("role") == "user":
+            content = msg.get("content", "")
+
+            # Extract potential subjects from the previous user query
+            # Look for noun phrases after common patterns
+            subject_patterns = [
+                r'(?:images?\s+(?:of|for)\s+)([a-zA-Z\s]+?)(?:\s*$|\s+diagram|\s+image)',
+                r'(?:what\s+is\s+(?:a|an|the)?\s*)([a-zA-Z\s]+?)(?:\s*\?|$)',
+                r'(?:explain\s+)([a-zA-Z\s]+?)(?:\s*$|\s+to\s+me)',
+                r'(?:tell\s+me\s+about\s+)([a-zA-Z\s]+?)(?:\s*$)',
+                r'(?:show\s+me\s+)([a-zA-Z\s]+?)(?:\s+images?|\s+diagrams?|\s*$)',
+                r'^([a-zA-Z\s]+?)\s+(?:images?|diagrams?|pictures?)$',
+                r'^([a-zA-Z\s]+?)\s*$',  # Just the subject itself
+            ]
+
+            for pattern in subject_patterns:
+                match = re.search(pattern, content, re.IGNORECASE)
+                if match:
+                    subject = match.group(1).strip()
+                    # Clean up common words
+                    subject = re.sub(r'\b(the|a|an|some|any)\b', '', subject, flags=re.IGNORECASE).strip()
+                    if subject and len(subject) > 2:
+                        recent_subject = subject
+                        break
+
+            if recent_subject:
+                break
+
+    if not recent_subject:
+        return query
+
+    # Replace pronouns with the actual subject
+    resolved_query = query
+    pronoun_replacements = [
+        (r'\bits\b', recent_subject + "'s"),
+        (r'\bit\b', recent_subject),
+        (r'\bthis\b', recent_subject),
+        (r'\bthat\b', recent_subject),
+        (r'\bthese\b', recent_subject),
+        (r'\bthose\b', recent_subject),
+    ]
+
+    for pattern, replacement in pronoun_replacements:
+        resolved_query = re.sub(pattern, replacement, resolved_query, flags=re.IGNORECASE)
+
+    # If query starts with generic action, prepend the subject
+    if re.match(r'^(give|tell|show|explain|what|how)', resolved_query, re.IGNORECASE):
+        # Check if subject is already in the resolved query
+        if recent_subject.lower() not in resolved_query.lower():
+            # Add subject context
+            resolved_query = f"{recent_subject}: {resolved_query}"
+
+    print(f"  [CONTEXT] Resolved follow-up: '{query}' → '{resolved_query}'")
+    return resolved_query
+
+
 def _format_context(texts: List[str], metadatas: List[dict]) -> str:
-    """Format retrieved documents into context - clean format without citation markers"""
+    """Format retrieved documents into context - clean format without any labels or citations"""
     context_parts = []
 
-    for i, (text, metadata) in enumerate(zip(texts, metadatas), 1):
-        # Clean format that doesn't encourage the LLM to add inline citations
-        # Remove page markers from text for cleaner context
+    for text, metadata in zip(texts, metadatas):
+        # Remove page/slide markers from text for cleaner context
         clean_text = re.sub(r'\[Page\s*\d+\]\s*', '', text)
         clean_text = re.sub(r'\[Slide\s*\d+\]\s*', '', clean_text)
-        context_parts.append(f"--- Document {i} ---\n{clean_text}")
+        # Just add the content without any document labels
+        context_parts.append(clean_text.strip())
 
-    return "\n\n".join(context_parts)
+    # Join with simple separator that won't encourage citations
+    return "\n\n---\n\n".join(context_parts)
 
 
 def _enrich_sources_with_pages(texts: List[str], metadatas: List[dict]) -> List[dict]:

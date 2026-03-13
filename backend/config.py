@@ -4,29 +4,42 @@ import os
 from pathlib import Path
 
 # ============================================================================
-# OLLAMA MODEL CONFIGURATION
+# HUGGINGFACE LOCAL CACHE CONFIGURATION (for portability)
+# ============================================================================
+# Set HuggingFace cache to local folder so models travel with the project
+HF_CACHE_DIR = Path(__file__).parent / "hf_cache"
+os.environ["HF_HOME"] = str(HF_CACHE_DIR)
+os.environ["TRANSFORMERS_CACHE"] = str(HF_CACHE_DIR)
+os.environ["SENTENCE_TRANSFORMERS_HOME"] = str(HF_CACHE_DIR)
+
+# ============================================================================
+# LLAMA.CPP DIRECT EXECUTION CONFIGURATION
 # ============================================================================
 
-# Using llama3.1:8b for better quality responses
-# Requires 16GB+ RAM for optimal performance
+# Model path (GGUF file)
+LLAMA_MODEL_PATH = Path(__file__).parent / "models" / "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
 
-OLLAMA_MODEL = "llama3.1:8b"  # Better quality model
+# Generation settings
+LLM_TEMPERATURE = 0.5
+LLM_MAX_TOKENS = 1024
+LLM_CONTEXT_SIZE = 4096  # Context window size
 
-# Alternative models:
-# OLLAMA_MODEL = "llama3.2:3b"    # Lighter, faster (good for 8GB RAM)
-# OLLAMA_MODEL = "llama3.2:1b"    # Smallest, fastest
+# CPU only mode (no GPU)
+LLM_GPU_LAYERS = 0
 
-OLLAMA_BASE_URL = "http://localhost:11434"  # Ollama server address
-OLLAMA_API_URL = OLLAMA_BASE_URL  # Alias for compatibility
-OLLAMA_TIMEOUT = 300  # Timeout in seconds (5 minutes for larger models like llama3.1:8b)
+# ============================================================================
+# SENTENCE-TRANSFORMERS CONFIGURATION
+# ============================================================================
+
+# Local embedding model using sentence-transformers
+EMBEDDING_MODEL_NAME = "nomic-ai/nomic-embed-text-v1"
+EMBEDDING_DIMENSION = 768  # Dimension for nomic-embed-text-v1
+EMBEDDING_BATCH_SIZE = 32  # Process embeddings in batches
+EMBEDDING_TRUST_REMOTE_CODE = True  # Required for nomic model
 
 # ============================================================================
 # VECTOR SEARCH CONFIGURATION
 # ============================================================================
-
-# Embedding model (using Ollama's nomic-embed-text)
-EMBEDDINGS_MODEL = "nomic-embed-text"  # 768 dims, better quality than MiniLM
-EMBEDDING_DIMENSION = 768  # Dimension for nomic-embed-text
 
 # Qdrant collection names
 COLLECTION_NAME_TEXT = "documents_text"
@@ -94,53 +107,32 @@ DEFAULT_TOPIC = "general"
 # LLM PROMPT CONFIGURATION
 # ============================================================================
 
-# System prompt for the model
-SYSTEM_PROMPT = """You are a knowledgeable technical assistant. Answer the question using the documents below.
-Provide DETAILED, COMPREHENSIVE, and INFORMATIVE responses.
+# System prompt for the model - OPTIMIZED for speed and document-only answers
+SYSTEM_PROMPT = """You are a document-based assistant. Answer using ONLY the reference content provided below.
 
-RESPONSE LENGTH & DEPTH:
-- Give thorough, well-explained answers (aim for 150-400 words minimum)
-- Include relevant background information and context
-- Explain the "why" behind concepts, not just the "what"
-- Provide examples, use cases, or practical applications when relevant
-- If there are multiple aspects to the topic, cover all of them
-- Include any important considerations, limitations, or best practices
+**CRITICAL RULES:**
+1. ONLY answer if the information exists in the reference content below
+2. If the question cannot be answered from the reference content, respond with:
+   "I don't have information about this topic in my documents."
+3. Do NOT use your general knowledge - ONLY use the reference content
+4. NEVER mention "Document 1", "Document 2", "found in documents", "according to the documents", or any source references
+5. Write your answer as if YOU know this information directly - do not cite or reference where it came from
 
-IMPORTANT FORMATTING RULES:
-- Do NOT include inline citations or references like "(Section X of document.pdf)" in your answer
-- Do NOT mention document names, page numbers, or section numbers in the answer text
-- Just provide the information directly and clearly
-- Images are handled separately by the system, so do not say you cannot show images
+**FORMATTING:**
+- Use **bold** for key terms
+- For comparisons: Use markdown tables
+- For lists: Use dashes (-)
+- For steps: Use **Step 1:**, **Step 2:** format
+- Use ## headers for long answers
+- ✅ for advantages, ⚠️ for disadvantages
 
-STYLE GUIDELINES (make responses engaging and easy to read):
-- Use **bold** for important terms, key values, and critical points
-- Use bullet points (•) for lists of features, steps, or characteristics
-- IMPORTANT: Each application, characteristic, feature, or list item must be on its OWN LINE
-  Example - WRONG: "Applications include pumps, valves, and compressors"
-  Example - CORRECT:
-  "Applications:
-  • Pumps
-  • Valves
-  • Compressors"
-- When comparing items, use a markdown table format like:
-  | Feature | Option A | Option B |
-  |---------|----------|----------|
-  | Cost    | Low      | High     |
-- Use emojis sparingly for visual cues (1-3 per response max):
-  • ✅ for advantages/benefits
-  • ⚠️ for warnings/cautions
-  • 💡 for tips or key insights
-  • 📌 for important notes
-- Keep paragraphs short (2-3 sentences max)
-- Use headers (##) for distinct sections in longer answers
+**RESPONSE STYLE:**
+- Be detailed but concise (150-400 words typical)
+- Explain the "why" not just "what"
+- Include specific values, percentages when available
+- Write naturally without referencing sources
 
-STRUCTURE FOR LONGER ANSWERS:
-- Start with a brief overview/definition
-- Explain key details and concepts
-- Include practical information (specifications, procedures, applications)
-- End with important notes or considerations if applicable
-
-Documents:
+Reference Content:
 {context}
 
 Question: {question}
@@ -170,7 +162,7 @@ MAX_RESPONSE_LENGTH = 4000  # Maximum characters in response
 # PARALLEL PROCESSING CONFIGURATION
 # ============================================================================
 
-# Number of concurrent Ollama embedding requests (conservative to avoid overload)
+# Number of concurrent embedding batch processes
 EMBEDDING_MAX_WORKERS = 4
 
 # Number of concurrent document processing threads
@@ -216,7 +208,7 @@ SQLALCHEMY_TRACK_MODIFICATIONS = False
 API_HOST = "0.0.0.0"
 API_PORT = 8000
 API_TITLE = "Document Chatbot API"
-API_DESCRIPTION = "Local document-based Q&A system with Ollama"
+API_DESCRIPTION = "Local document-based Q&A system with llama.cpp"
 
 # CORS settings (for local development)
 CORS_ORIGINS = [
@@ -241,62 +233,60 @@ LOG_FILE = DATA_DIR / "chatbot.log"
 
 """
 CURRENT CONFIGURATION:
-- LLM Model: llama3.1:8b (8B parameters, needs ~5-6GB RAM)
-- Embedding Model: nomic-embed-text (via Ollama, 768 dimensions)
+- LLM: llama-cpp-python (direct execution, no server needed)
+- LLM Model: Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf (~4.7 GB, needs ~6GB RAM)
+- Embedding Model: nomic-ai/nomic-embed-text-v1 (via sentence-transformers, 768 dimensions)
 - Vector Database: Qdrant (local file storage, no server required)
 
 REQUIREMENTS:
-- RAM: 16GB+ recommended for llama3.1:8b
-- If you have less RAM, change OLLAMA_MODEL to "llama3.2:3b"
+- RAM: 16GB+ recommended
+- Python packages: llama-cpp-python, sentence-transformers, torch, transformers
 
 SETUP COMMANDS:
-ollama pull llama3.1:8b
-ollama pull nomic-embed-text
+# 1. Install Python dependencies
+pip install -r requirements.txt
+
+# 2. Download GGUF model to backend/models/
+# From: https://huggingface.co/lmstudio-ai/Meta-Llama-3.1-8B-Instruct-GGUF
+
+# 3. Run the backend (no separate server needed!)
+python -m uvicorn main:app --reload --port 8000
 
 TROUBLESHOOTING:
-Issue: "Connection refused" at localhost:11434
-→ Run: ollama serve (keep running)
-
-Issue: "Model not found"
-→ Run: ollama pull llama3.1:8b && ollama pull nomic-embed-text
-
 Issue: "Out of memory" error
-→ Change OLLAMA_MODEL to "llama3.2:3b"
-→ Reduce TOP_K_DOCUMENTS to 3
+→ Use a smaller quantized model (Q3_K_M instead of Q4_K_M)
+→ Reduce LLM_CONTEXT_SIZE to 2048
 
 Issue: Qdrant errors
 → Delete data/qdrant_db/ folder and re-run ingest
 
-EMBEDDING MODEL BENEFITS (nomic-embed-text):
+EMBEDDING MODEL BENEFITS (nomic-embed-text-v1):
 - 768 dimensions (vs 384 for all-MiniLM-L6-v2)
 - Better semantic understanding
-- Runs via Ollama (no separate Python ML libs needed)
-- Lower memory footprint (no PyTorch required)
-
-QDRANT BENEFITS:
-- Local file storage (no server required)
-- Fast vector search with HNSW index
-- Better filtering and payload support
-- Production-ready with optional server mode
+- Runs locally via sentence-transformers
+- No external API calls needed
 """
 
 # ============================================================================
 # VERSION INFO
 # ============================================================================
 
-__version__ = "4.0"
-__model_version__ = "llama3.1:8b + nomic-embed-text + Qdrant"
+__version__ = "6.0"
+__model_version__ = "llama-cpp-python (direct) + sentence-transformers + Qdrant"
 __last_updated__ = "March 2026"
 __changes__ = """
-CHANGES (v4.0):
-- Vector Database: ChromaDB → Qdrant (better performance, no ONNX issues)
-- Qdrant uses local file storage (no server required)
-- Improved vector search with native filtering support
-- Better memory efficiency and faster search
+CHANGES (v6.0):
+- LLM: llama.cpp server → llama-cpp-python direct execution
+- No separate server process needed - model runs inside Python
+- Simpler deployment: just run uvicorn, model loads automatically
+- GPU acceleration support via LLM_GPU_LAYERS config
+- More portable: single process, no HTTP overhead
 
-CHANGES (v3.0):
-- OLLAMA_MODEL: llama3.2:3b → llama3.1:8b (better quality)
-- EMBEDDINGS_MODEL: sentence-transformers → nomic-embed-text (via Ollama)
-- Removed heavy dependencies (torch, sentence-transformers, transformers)
-- Embeddings now use Ollama API instead of local Python models
+CHANGES (v5.0):
+- LLM Server: Ollama → llama.cpp (OpenAI-compatible API)
+- Embeddings: Ollama API → sentence-transformers (local Python model)
+
+CHANGES (v4.0):
+- Vector Database: ChromaDB → Qdrant
+- Qdrant uses local file storage (no server required)
 """

@@ -1,29 +1,95 @@
-import requests
-import json
-from typing import List
-from config import OLLAMA_API_URL, OLLAMA_MODEL, SYSTEM_PROMPT, IMAGE_SEARCH_PROMPT, OLLAMA_TIMEOUT
+import os
+from pathlib import Path
+from typing import List, Generator
+from llama_cpp import Llama
+from config import (
+    LLAMA_MODEL_PATH,
+    LLM_TEMPERATURE,
+    LLM_MAX_TOKENS,
+    LLM_CONTEXT_SIZE,
+    LLM_GPU_LAYERS,
+    SYSTEM_PROMPT,
+    IMAGE_SEARCH_PROMPT,
+)
+
+# Model download settings
+LLAMA_REPO_ID = "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF"
+LLAMA_FILENAME = "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
 
 
 class LLMService:
     def __init__(self):
-        """Initialize LLM service"""
-        self.api_url = OLLAMA_API_URL
-        self.model = OLLAMA_MODEL
-        self._verify_connection()
+        """Initialize LLM service with direct llama-cpp-python execution"""
+        self.model_path = Path(LLAMA_MODEL_PATH)
+        self.temperature = LLM_TEMPERATURE
+        self.max_tokens = LLM_MAX_TOKENS
+        self._model = None  # Lazy-loaded
 
-    def _verify_connection(self):
-        """Verify Ollama is running"""
+    def _download_model(self):
+        """Download the GGUF model from HuggingFace if not present"""
+        if self.model_path.exists():
+            return
+
+        print(f"[INFO] Model not found: {self.model_path}")
+        print(f"[INFO] Downloading from HuggingFace ({LLAMA_REPO_ID})...")
+        print(f"       This will download ~4.6GB. Please wait...")
+
         try:
-            response = requests.get(f"{self.api_url}/api/tags")
-            if response.status_code == 200:
-                print(f"[OK] Connected to Ollama at {self.api_url}")
-                return True
-            else:
-                print(f"[ERROR] Ollama connection failed: {response.status_code}")
-                return False
+            from huggingface_hub import hf_hub_download
+
+            # Ensure models directory exists
+            self.model_path.parent.mkdir(parents=True, exist_ok=True)
+
+            # Download model
+            hf_hub_download(
+                repo_id=LLAMA_REPO_ID,
+                filename=LLAMA_FILENAME,
+                local_dir=str(self.model_path.parent),
+            )
+            print(f"[OK] Model downloaded successfully")
+
         except Exception as e:
-            print(f"[ERROR] Cannot connect to Ollama: {str(e)}")
-            print(f"  Make sure Ollama is running: ollama serve")
+            print(f"[ERROR] Failed to download model: {e}")
+            print(f"")
+            print(f"Please download manually:")
+            print(f"  python -c \"")
+            print(f"  from huggingface_hub import hf_hub_download")
+            print(f"  hf_hub_download(")
+            print(f"      repo_id='{LLAMA_REPO_ID}',")
+            print(f"      filename='{LLAMA_FILENAME}',")
+            print(f"      local_dir='./models'")
+            print(f"  )\"")
+            raise
+
+    def _load_model(self) -> Llama:
+        """Lazy-load the LLM model (downloads if missing)"""
+        if self._model is None:
+            # Auto-download if missing
+            self._download_model()
+
+            print(f"[INFO] Loading LLM model: {self.model_path}")
+            print(f"       This may take a minute...")
+
+            try:
+                self._model = Llama(
+                    model_path=str(self.model_path),
+                    n_ctx=LLM_CONTEXT_SIZE,
+                    n_gpu_layers=LLM_GPU_LAYERS,
+                    verbose=False,
+                )
+                print(f"[OK] LLM model loaded successfully")
+            except Exception as e:
+                print(f"[ERROR] Failed to load LLM model: {e}")
+                raise
+
+        return self._model
+
+    def _verify_connection(self) -> bool:
+        """Check if model can be loaded (for health check compatibility)"""
+        try:
+            self._load_model()
+            return True
+        except Exception:
             return False
 
     def generate_answer(self, context: str, question: str) -> str:
@@ -38,8 +104,7 @@ class LLMService:
             Generated answer
         """
         prompt = SYSTEM_PROMPT.format(context=context, question=question)
-
-        return self._call_ollama(prompt)
+        return self._call_llm(prompt)
 
     def detect_image_intent(self, question: str) -> bool:
         """
@@ -52,13 +117,12 @@ class LLMService:
             True if asking for images, False otherwise
         """
         prompt = IMAGE_SEARCH_PROMPT.format(question=question)
-
-        response = self._call_ollama(prompt)
+        response = self._call_llm(prompt)
         return "SHOW_IMAGE" in response.upper()
 
-    def _call_ollama(self, prompt: str) -> str:
+    def _call_llm(self, prompt: str) -> str:
         """
-        Call Ollama API without streaming
+        Call LLM directly using llama-cpp-python
 
         Args:
             prompt: Prompt to send
@@ -67,30 +131,26 @@ class LLMService:
             Generated response
         """
         try:
-            url = f"{self.api_url}/api/generate"
+            model = self._load_model()
 
-            payload = {
-                "model": self.model,
-                "prompt": prompt,
-                "stream": False,
-                "temperature": 0.7,
-                "num_predict": 2048,  # Allow longer responses (default is often 128)
-            }
+            response = model.create_chat_completion(
+                messages=[
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=self.temperature,
+                max_tokens=self.max_tokens,
+            )
 
-            response = requests.post(url, json=payload, timeout=OLLAMA_TIMEOUT)
-            response.raise_for_status()
+            choices = response.get("choices", [])
+            if choices:
+                message = choices[0].get("message", {})
+                return message.get("content", "").strip()
+            return ""
 
-            result = response.json()
-            return result.get("response", "").strip()
-
-        except requests.exceptions.Timeout:
-            return "Error: Request timed out. The model may be slow or Ollama may be unresponsive."
-        except requests.exceptions.ConnectionError:
-            return "Error: Cannot connect to Ollama. Make sure it's running with 'ollama serve'"
         except Exception as e:
             return f"Error generating response: {str(e)}"
 
-    def generate_answer_stream(self, context: str, question: str):
+    def generate_answer_stream(self, context: str, question: str) -> Generator[str, None, None]:
         """
         Generate answer using LLM with streaming response
 
@@ -104,34 +164,29 @@ class LLMService:
         prompt = SYSTEM_PROMPT.format(context=context, question=question)
 
         try:
-            url = f"{self.api_url}/api/generate"
+            model = self._load_model()
 
-            payload = {
-                "model": self.model,
-                "prompt": prompt,
-                "stream": True,
-                "temperature": 0.7,
-                "num_predict": 2048,  # Allow longer responses
-            }
+            stream = model.create_chat_completion(
+                messages=[
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=self.temperature,
+                max_tokens=self.max_tokens,
+                stream=True,
+            )
 
-            with requests.post(url, json=payload, stream=True, timeout=OLLAMA_TIMEOUT) as response:
-                response.raise_for_status()
-                for line in response.iter_lines():
-                    if line:
-                        try:
-                            data = json.loads(line)
-                            token = data.get("response", "")
-                            if token:
-                                yield token
-                            if data.get("done", False):
-                                break
-                        except json.JSONDecodeError:
-                            continue
+            for chunk in stream:
+                choices = chunk.get("choices", [])
+                if choices:
+                    delta = choices[0].get("delta", {})
+                    content = delta.get("content", "")
+                    if content:
+                        yield content
 
-        except requests.exceptions.Timeout:
-            yield "Error: Request timed out."
-        except requests.exceptions.ConnectionError:
-            yield "Error: Cannot connect to Ollama."
+                    finish_reason = choices[0].get("finish_reason")
+                    if finish_reason:
+                        break
+
         except Exception as e:
             yield f"Error: {str(e)}"
 
@@ -153,7 +208,7 @@ class LLMService:
 
 Summary:"""
 
-        return self._call_ollama(prompt)
+        return self._call_llm(prompt)
 
 
 # Global instance
